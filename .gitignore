@@ -1,4 +1,6 @@
 Make*
+!tests/Makefile
+!example/Makefile
 .deps
 .libs
 acinclude.m4
@@ -29,3 +31,20 @@ run-tests.php
 stamp-h1
 example/server
 example/client
+
+# C binaries and debug symbols
+example/cross_server
+example/cross_client
+*.dSYM/
+tests/test_protocol
+tests/test_pack
+tests/test_request
+tests/test_response
+tests/test_client_server
+
+# OMC state
+.omc/
+
+# Added by cargo
+
+/target
