@@ -3,6 +3,8 @@
 //! Verifies that the Rust pack/unpack implementation produces byte-identical
 //! output to the C msgpack wrapper (yar_pack.c) and can parse C-produced bytes.
 
+#![allow(clippy::approx_constant)] // 3.14 is a deliberate C test vector
+
 use yar_rs::*;
 
 // ---------------------------------------------------------------------------

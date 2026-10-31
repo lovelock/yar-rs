@@ -522,6 +522,7 @@ impl<'a> UnpackIterator<'a> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)] // 3.14 is a deliberate C test vector
 mod tests {
     use super::*;
 

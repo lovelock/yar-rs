@@ -1,18 +1,17 @@
-//! Cross-language integration test: Rust client talks to C server.
+//! Cross-language (wire-format) verification tests.
 //!
-//! This test starts the C example server (compiled from test_client_server.c)
-//! and connects to it with the Rust YarClient.
+//! These tests construct wire packets exactly as the original C implementation
+//! would produce them and verify that the Rust code can parse them byte-for-byte.
+//! The original C implementation (legacy/) has been removed; these recorded
+//! wire formats remain the compatibility contract.
 //!
-//! Run with: cargo test --test test_cross_language -- --ignored
-//!
-//! Prerequisites:
-//!   - C server binary must exist at tests/test_client_server
-//!   - Build with: make -C tests
+//! Run with: cargo test --test test_cross_language
 
-use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 use yar_rs::*;
+
+// ---------------------------------------------------------------------------
+// Wire-level cross-language verification
+// ---------------------------------------------------------------------------
 
 /// Helper: safely read a u32 from a packed YarHeader field.
 macro_rules! packed_u32 {
@@ -21,124 +20,6 @@ macro_rules! packed_u32 {
         unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
     }};
 }
-
-/// Path to the C server binary (relative to workspace root).
-const C_SERVER_BINARY: &str = "tests/test_client_server";
-
-/// Check if the C server binary exists.
-fn c_server_exists() -> bool {
-    let workspace_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    let path = std::path::Path::new(&workspace_root).join(C_SERVER_BINARY);
-    path.exists()
-}
-
-/// Start the C server as a child process.
-/// The C server test binary runs its own server on a hardcoded port.
-fn start_c_server() -> Option<Child> {
-    let workspace_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    let binary_path = std::path::Path::new(&workspace_root).join(C_SERVER_BINARY);
-
-    if !binary_path.exists() {
-        return None;
-    }
-
-    // The C test binary may run tests and start a server.
-    // We look for the server startup in its output.
-    let child = Command::new(binary_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    Some(child)
-}
-
-// ---------------------------------------------------------------------------
-// Cross-language test: Rust client -> C server
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "requires C server binary (build with: make -C tests)"]
-fn test_cross_language_rust_client_c_server() {
-    if !c_server_exists() {
-        eprintln!("Skipping: C server binary not found at {}", C_SERVER_BINARY);
-        return;
-    }
-
-    let mut child = match start_c_server() {
-        Some(c) => c,
-        None => {
-            eprintln!("Skipping: failed to start C server");
-            return;
-        }
-    };
-
-    // Give the C server time to start listening
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Read server output to find the port it's listening on
-    // The C test binary typically prints its port or uses a known port.
-    // For the test_client_server binary, it uses a fork-based approach
-    // and the server listens on a port printed to stdout.
-
-    // Try connecting to the default test port used by the C test suite
-    let test_ports = [9501u16, 9502, 9503, 8080, 12345];
-    let mut connected = false;
-
-    for &port in &test_ports {
-        let addr = format!("127.0.0.1:{}", port);
-        if let Ok(stream) = TcpStream::connect_timeout(
-            &addr.parse().unwrap(),
-            Duration::from_millis(500),
-        ) {
-            // Found the server
-            drop(stream);
-            connected = true;
-
-            // Try to call the "echo" method using the Rust client
-            let result = std::panic::catch_unwind(|| {
-                let mut client = YarClient::connect(&addr).unwrap();
-                client.set_timeout(Duration::from_secs(3));
-
-                // Call the echo handler registered by the C server
-                let response = client.call("echo", vec![]);
-                match response {
-                    Ok(resp) => {
-                        // The C echo handler returns "echo:ok"
-                        if resp.get_status() == 0 {
-                            if let Some(rv) = resp.get_response() {
-                                assert_eq!(rv.as_str(), Some("echo:ok"));
-                            }
-                        }
-                        // Non-zero status is acceptable - it means we reached the server
-                    }
-                    Err(_e) => {
-                        // Connection errors are OK for this test - we just want
-                        // to verify wire compatibility at the protocol level
-                    }
-                }
-
-                client.close();
-            });
-
-            let _ = result; // Don't fail the test on panics
-            break;
-        }
-    }
-
-    // Clean up: kill the C server
-    let _ = child.kill();
-    let _ = child.wait();
-
-    if !connected {
-        eprintln!("Note: Could not connect to C server on any test port. \
-                   This is expected if the C test binary uses fork-based testing.");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire-level cross-language verification
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_cross_language_wire_format_compatibility() {
