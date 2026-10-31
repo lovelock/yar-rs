@@ -25,6 +25,10 @@ use crate::PACKAGER_NAME;
 
 pub const SERVER_NAME: &str = "Yar Rust Server 0.1.0";
 
+/// Default maximum request body size accepted by the server (8 MiB, as
+/// `yar_server` does in the C implementation).
+pub const DEFAULT_MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
+
 /// Handler function type: takes request, returns response.
 pub type YarHandler = Box<dyn Fn(&YarRequest) -> YarResponse + Send + Sync>;
 
@@ -33,6 +37,7 @@ pub struct YarServer {
     hostname: String,
     handlers: Arc<RwLock<HashMap<String, YarHandler>>>,
     max_workers: usize,
+    max_request_size: usize,
     stand_alone: bool,
     read_timeout: Duration,
     log_file: Option<String>,
@@ -167,6 +172,7 @@ impl YarServer {
             hostname: hostname.to_string(),
             handlers: Arc::new(RwLock::new(HashMap::new())),
             max_workers: 1,
+            max_request_size: DEFAULT_MAX_REQUEST_SIZE,
             stand_alone: true,
             read_timeout: Duration::from_secs(3),
             log_file: None,
@@ -203,6 +209,15 @@ impl YarServer {
     /// The value is clamped to the range [1, 128].
     pub fn set_max_workers(&mut self, n: usize) {
         self.max_workers = n.clamp(1, 128);
+    }
+
+    /// Sets the maximum request body size (in bytes) the server accepts.
+    ///
+    /// A request whose header declares a larger body is rejected with an
+    /// error response before the body is read, protecting the server from
+    /// excessive memory allocation. Defaults to 8 MiB.
+    pub fn set_max_request_size(&mut self, bytes: usize) {
+        self.max_request_size = bytes;
     }
 
     /// Sets the per-request read timeout.
@@ -263,6 +278,7 @@ impl YarServer {
 
                 let handlers = self.handlers.clone();
                 let read_timeout = self.read_timeout;
+                let max_request_size = self.max_request_size;
                 let _max_workers = self.max_workers;
 
                 // Accept connections. Spawn a task per connection, with a
@@ -294,6 +310,7 @@ impl YarServer {
                             &mut stream,
                             &handlers,
                             read_timeout,
+                            max_request_size,
                         ).await;
                     });
                 }
@@ -313,6 +330,7 @@ async fn handle_connection_with_timeout<S>(
     stream: &mut S,
     handlers: &Arc<RwLock<HashMap<String, YarHandler>>>,
     read_timeout: Duration,
+    max_request_size: usize,
 ) -> YarResult<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
@@ -332,10 +350,17 @@ where
             let is_persistent = (header.reserved & PROTOCOL_PERSISTENT) != 0;
             let body_len = header.body_len as usize;
 
+            // Memory firewall: if the declared body exceeds the configured
+            // limit, do not read (or allocate for) the body at all — signal
+            // the oversized request back to the caller with an empty body.
+            if body_len > max_request_size {
+                return Ok::<_, YarError>((header, is_persistent, None));
+            }
+
             // Read body
             let body_bytes = read_exact(stream, body_len).await?;
 
-            Ok::<_, YarError>((header, is_persistent, body_bytes))
+            Ok::<_, YarError>((header, is_persistent, Some(body_bytes)))
         })
         .await;
 
@@ -357,6 +382,38 @@ where
         };
 
         let extra_bytes = HEADER_SIZE + PACKAGER_NAME.len();
+
+        // Reject oversized requests without reading their body: reply with an
+        // error response and close the connection.
+        let body_bytes = match body_bytes {
+            Some(b) => b,
+            None => {
+                // YarHeader is packed: copy the fields we need via unaligned
+                // reads before referencing them (as in the packed_u32! helper).
+                let declared_len =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(header.body_len)) };
+                let req_id =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(header.id)) };
+
+                logger::log_global(
+                    logger::LogLevel::Warning,
+                    &format!(
+                        "Request too large: {} > {} bytes, rejecting",
+                        declared_len, max_request_size
+                    ),
+                );
+                let resp = YarResponse::error(
+                    req_id as u64,
+                    1,
+                    &format!(
+                        "request too large: {} > {}",
+                        declared_len, max_request_size
+                    ),
+                );
+                let _ = send_response(stream, &resp, extra_bytes).await;
+                return Ok(());
+            }
+        };
 
         // Verify packager name
         if body_bytes.len() < PACKAGER_NAME.len() {
@@ -629,6 +686,7 @@ mod tests {
                 &mut stream,
                 &handlers,
                 Duration::from_secs(5),
+                DEFAULT_MAX_REQUEST_SIZE,
             ).await;
             let _ = stream.shutdown().await;
         });
@@ -687,6 +745,7 @@ mod tests {
                 &mut stream,
                 &handlers,
                 Duration::from_secs(5),
+                DEFAULT_MAX_REQUEST_SIZE,
             ).await;
             let _ = stream.shutdown().await;
         });
@@ -745,6 +804,7 @@ mod tests {
                 &mut stream,
                 &handlers,
                 Duration::from_secs(5),
+                DEFAULT_MAX_REQUEST_SIZE,
             ).await;
             let _ = stream.shutdown().await;
         });
