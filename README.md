@@ -9,6 +9,21 @@ Yar C framework: it speaks the exact same wire protocol, so a `yar-rs`
 server can serve requests from Yar clients written in PHP, Java, C, or
 Rust — and vice versa.
 
+## Documentation (中文用户指南)
+
+完整的中文用户手册在 [`docs/`](docs/README.md)：
+
+- [快速上手](docs/getting-started.md)
+- [服务端指南](docs/server.md)
+- [客户端指南](docs/client.md)
+- [数据模型](docs/data.md)
+- [协议与跨语言互通](docs/protocol.md)
+- [错误与日志](docs/errors-logging.md)
+- [FAQ 与 C→Rust 迁移对照](docs/faq.md)
+
+指南中的所有示例代码都在 `tests/doc_examples.rs` 中被编译并执行校验，
+`cargo test` 保证文档始终可用。
+
 ## Features
 
 - **Wire-compatible** with the classic Yar protocol: 82-byte big-endian
