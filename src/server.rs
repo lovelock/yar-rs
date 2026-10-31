@@ -249,9 +249,17 @@ impl YarServer {
         // Initialize logger
         let log_file = self.log_file.as_deref();
         if logger::global().is_none() {
-            logger::init_global(log_file, self.log_level).map_err(|e| {
-                YarError::Protocol(format!("Failed to initialize logger: {}", e))
-            })?;
+            // Two servers can be started concurrently in one process; racing
+            // here is benign — the loser of init_global reports "already set"
+            // while a logger exists, which must not abort the startup.
+            if let Err(e) = logger::init_global(log_file, self.log_level) {
+                if logger::global().is_none() {
+                    return Err(YarError::Protocol(format!(
+                        "Failed to initialize logger: {}",
+                        e
+                    )));
+                }
+            }
         }
 
         logger::set_hostname(&format!("yar-rs-server-{}", std::process::id()));

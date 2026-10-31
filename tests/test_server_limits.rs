@@ -55,6 +55,77 @@ fn start_server(
 }
 
 // ---------------------------------------------------------------------------
+// Concurrent server startup in one process must be benign
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_concurrent_server_start_same_process() {
+    // Two servers whose run() calls race the global-logger check-then-init
+    // in run_standalone. The loser (whose init_global hits "already set")
+    // must still bind and serve — an early exit here is the regression.
+    let barrier = std::sync::Barrier::new(2);
+    let barrier = std::sync::Arc::new(barrier);
+    let (early_exit_tx, early_exit_rx) = std::sync::mpsc::channel();
+
+    let mut addresses = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..2 {
+        let port = find_available_port();
+        let addr = format!("127.0.0.1:{}", port);
+        ports.push(port);
+        addresses.push(addr.clone());
+
+        let barrier = barrier.clone();
+        let early_exit_tx = early_exit_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let mut server = YarServer::new(&addr);
+                server.set_max_request_size(4096);
+                server.register_handler("echo", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"echo:ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
+                // Align both run() calls so the concurrent init race is hit.
+                barrier.wait();
+                server.run().await
+            });
+            // Only run() errors ever reach this send (success never returns
+            // from the accept loop); relayed so the test can assert on it.
+            let _ = early_exit_tx.send(result);
+        });
+    }
+    drop(early_exit_tx);
+
+    for addr in &addresses {
+        wait_for_port(ports.remove(0));
+
+        let mut client = YarClient::connect(addr).unwrap_or_else(|e| {
+            panic!(
+                "server on {} failed to start: {} — concurrent logger init must be benign",
+                addr, e
+            )
+        });
+        client.set_timeout(Duration::from_secs(5));
+
+        let response = client.call("echo", vec![]).unwrap();
+        assert_eq!(response.get_status(), 0);
+        let retval = response.get_response().unwrap();
+        assert_eq!(retval.as_str(), Some("echo:ok"));
+
+        client.close();
+    }
+
+    // No server may have exited early during the racing startup.
+    match early_exit_rx.recv_timeout(Duration::from_millis(500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {} // all still serving
+        other => panic!("a server exited early during startup: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory firewall: oversized requests rejected from the header alone
 // ---------------------------------------------------------------------------
 
