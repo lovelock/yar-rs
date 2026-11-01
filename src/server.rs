@@ -441,8 +441,20 @@ where
                 return Ok::<_, YarError>((header, is_persistent, None));
             }
 
-            // Read body
-            let body_bytes = read_exact_idle(stream, body_len, read_timeout).await?;
+            // Read body. A peer that announced a body and then vanished has
+            // truncated the request, even if zero body bytes arrived — that is
+            // not the routine "connected and went away" close the header read
+            // reports as Connection.
+            let body_bytes = match read_exact_idle(stream, body_len, read_timeout).await {
+                Ok(b) => b,
+                Err(YarError::Connection(_)) => {
+                    return Err(YarError::Protocol(format!(
+                        "unexpected EOF while reading {} bytes",
+                        body_len
+                    )))
+                }
+                Err(e) => return Err(e),
+            };
 
             Ok::<_, YarError>((header, is_persistent, Some(body_bytes)))
         }

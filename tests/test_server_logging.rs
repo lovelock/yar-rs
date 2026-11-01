@@ -74,6 +74,21 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
     partial.flush().unwrap();
     drop(partial);
 
+    // 3) a complete header announcing a body, then close without the body:
+    //    still a truncated request even though zero body bytes arrived.
+    let mut header = yar_rs::protocol::YarHeader::new();
+    header.render(1, None, None, 1024, 0);
+    let header_bytes: [u8; yar_rs::protocol::HEADER_SIZE] = unsafe {
+        std::ptr::read_unaligned(
+            &header as *const yar_rs::protocol::YarHeader
+                as *const [u8; yar_rs::protocol::HEADER_SIZE],
+        )
+    };
+    let mut no_body = std::net::TcpStream::connect(&addr).unwrap();
+    no_body.write_all(&header_bytes).unwrap();
+    no_body.flush().unwrap();
+    drop(no_body);
+
     assert!(
         wait_until(Duration::from_secs(5), || {
             let text = read_log(&log_path);
@@ -95,8 +110,8 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
         .collect();
     assert_eq!(
         notices.len(),
-        1,
-        "only the truncated request should produce a NOTICE read error, got {}:\n{}",
+        2,
+        "the two truncated requests (not the clean close) should produce NOTICEs, got {}:\n{}",
         notices.len(),
         text
     );
