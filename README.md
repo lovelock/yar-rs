@@ -107,7 +107,7 @@ client.close();
 cargo test
 ```
 
-The test suite (161 tests) includes:
+The test suite (229 tests) includes:
 
 - Unit tests for protocol header render/parse, request/response
   pack/unpack, and the packager/unpacker.
@@ -115,6 +115,24 @@ The test suite (161 tests) includes:
   C implementation are parsed by the Rust code, and Rust-produced packets
   are verified to match the C wire layout.
 - Full client↔server integration tests over real TCP connections.
+
+## Profiler (C vs Rust benchmark)
+
+[`profile/`](profile/README.md) contains a k6-style benchmark that puts this
+Rust implementation side by side with the original C one (`../yar-c`) under
+identical 2 CPU / 2 GB containers: one persistent connection per virtual
+user, a body-size × VU matrix, and a CSV report with QPS, ok/fail,
+p50/p95/p99/p99.9, plus the server container's CPU share and memory peak.
+
+```sh
+podman build -f profile/Dockerfile -t yar-bench-rust .
+stage=$(profile/stage.sh) && podman build -f profile/Dockerfile-yarc -t yar-bench-c "$stage" && rm -rf "$stage"
+./profile/run.sh --target rust --matrix quick
+./profile/run.sh --target c    --matrix quick
+```
+
+See [profile/README.md](profile/README.md) for the matrix, the resource
+parity rules, the report columns, and sample results.
 
 ## License
 
