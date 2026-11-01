@@ -217,9 +217,11 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
             let mut client = match YarClient::connect(&host) {
                 Ok(c) => c,
                 Err(e) => {
+                    // A connection error is a failed sample (spec: failures
+                    // include connection errors), not an empty stage.
                     let _ = tx.send(ThreadOutcome {
                         ok: 0,
-                        fail: 0,
+                        fail: 1,
                         latencies_ms: Vec::new(),
                         first_error: Some(format!("connect failed: {}", e)),
                     });
@@ -250,7 +252,29 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
                         outcome.ok += 1;
                         outcome.latencies_ms.push(latency_ms);
                     }
-                    Err(msg) => outcome.note_failure(msg),
+                    Err(msg) => {
+                        outcome.note_failure(msg);
+                        // A transport failure leaves the persistent socket
+                        // dead or out of sync. Reusing it would turn the rest
+                        // of the stage into a microsecond-fast failure loop
+                        // that inflates fail/qps and burns CPU; dial again,
+                        // as a k6 VU would. A content/status failure is a
+                        // server-side answer, so the connection stays.
+                        if result.is_err() {
+                            match YarClient::connect(&host) {
+                                Ok(mut fresh) => {
+                                    fresh.set_timeout(CALL_TIMEOUT);
+                                    fresh.set_persistent(true);
+                                    client = fresh;
+                                }
+                                Err(e) => {
+                                    outcome
+                                        .note_failure(format!("reconnect failed: {}", e));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             let _ = tx.send(outcome);

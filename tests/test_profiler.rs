@@ -358,3 +358,133 @@ fn test_end_to_end_profile_two_stages() {
     let header = "size_bytes,vus,duration_s,qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts";
     assert_eq!(text.lines().next(), Some(header));
 }
+
+// ---------------------------------------------------------------------------
+// Failure accounting and connection recovery
+// ---------------------------------------------------------------------------
+
+/// A connection error is a failed sample (spec: failure judgment includes
+/// connection errors), never a silently empty stage.
+#[test]
+fn test_connect_failure_is_counted_as_failure() {
+    // Reserve a port and release it, so nothing is listening there.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = ProfilerConfig {
+        host: format!("127.0.0.1:{}", port),
+        body_sizes: vec![64],
+        vus: vec![2],
+        step_time: Duration::from_millis(200),
+    };
+
+    let reports = run_profile(&cfg).expect("a refused connection is not a run error");
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    assert_eq!(r.ok, 0, "no call can succeed without a server");
+    assert!(
+        r.fail >= 2,
+        "each VU's failed connect must count as a failure, got {}",
+        r.fail
+    );
+    assert!(
+        r.first_error.contains("connect failed"),
+        "first_error should name the failure, got {:?}",
+        r.first_error
+    );
+}
+
+/// The server answers the first connection and hangs up, then keeps every
+/// later connection alive. A VU must dial a fresh connection after the hangup
+/// instead of hammering the dead socket for the rest of the stage (which used
+/// to inflate `fail`/`qps` while burning CPU).
+#[test]
+fn test_vu_reconnects_when_the_server_closes_the_connection() {
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use yar_rs::pack::Packager;
+    use yar_rs::protocol::{YarHeader, HEADER_SIZE};
+    use yar_rs::response::YarResponse;
+    use yar_rs::PACKAGER_NAME;
+
+    const BODY: usize = 64;
+    let body: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+
+    fn echo_response(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut one = Packager::new();
+        one.push_string(body).unwrap();
+        let mut arr = Packager::start_array(1).unwrap();
+        arr.push_packager(&one).unwrap();
+        let resp = YarResponse::success(id as u64, arr);
+
+        let extra = HEADER_SIZE + PACKAGER_NAME.len();
+        let mut payload = resp.pack(extra).unwrap();
+        let resp_len = (payload.len() - HEADER_SIZE) as u32;
+        let mut header = YarHeader::new();
+        header.render(id, None, None, resp_len, 0);
+        let header_bytes: [u8; HEADER_SIZE] = unsafe {
+            std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
+        };
+        payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
+        payload[HEADER_SIZE..extra].copy_from_slice(PACKAGER_NAME);
+        payload
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let body = body.clone();
+            let first = connections.fetch_add(1, Ordering::SeqCst) == 0;
+            std::thread::spawn(move || loop {
+                let mut header = [0u8; HEADER_SIZE];
+                if stream.read_exact(&mut header).is_err() {
+                    return;
+                }
+                let (id, body_len) = match YarHeader::from_bytes(&header) {
+                    Ok(h) => (h.id, h.body_len as usize),
+                    Err(_) => return,
+                };
+                let mut req_body = vec![0u8; body_len];
+                if stream.read_exact(&mut req_body).is_err() {
+                    return;
+                }
+                if stream.write_all(&echo_response(id, &body)).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                if first {
+                    return; // hang up after the first response on this connection only
+                }
+            });
+        }
+    });
+
+    let cfg = ProfilerConfig {
+        host: format!("127.0.0.1:{}", port),
+        body_sizes: vec![BODY],
+        vus: vec![2],
+        step_time: Duration::from_millis(600),
+    };
+    let reports = run_profile(&cfg).expect("profile run failed");
+    let r = &reports[0];
+    assert!(
+        r.ok > 100,
+        "expected the VU to keep working after a reconnect, got ok={} fail={} err={:?}",
+        r.ok,
+        r.fail,
+        r.first_error
+    );
+    assert!(
+        r.fail <= 2,
+        "a closed connection must be re-dialed, not retried: fail={} err={:?}",
+        r.fail,
+        r.first_error
+    );
+}

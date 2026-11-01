@@ -70,7 +70,6 @@ enum Address {
     Unix(String),
 }
 
-/// Read exactly `n` bytes from the reader into a new Vec.
 /// Read exactly `n` bytes, applying `timeout` to each individual read.
 ///
 /// This is an *idle* timeout, matching the C server's `YAR_READ_TIMEOUT`: a
