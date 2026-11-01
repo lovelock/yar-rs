@@ -130,7 +130,9 @@ under 2 GB; the server under test keeps the mandated 2 GB.
 
 One `--matrix quick` run per target on the same machine (2 CPU / 2 GB per
 server container, `--network=host`, 10 s per stage, Rust server
-`--inflight 0`, C server `-n 2`):
+`--inflight 0`, C server `-n 2`). The full 15-column outputs are committed at
+[`profile/results/report-rust-quick.csv`](results/report-rust-quick.csv) and
+[`profile/results/report-c-quick.csv`](results/report-c-quick.csv):
 
 | body | VUs | Rust QPS | C QPS | Rust p99 ms | C p99 ms | Rust cpu% | C cpu% | Rust mem | C mem | Rust fail | C fail |
 |---|---|---|---|---|---|---|---|---|---|---|---|
