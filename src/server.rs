@@ -310,9 +310,9 @@ impl YarServer {
                     None
                 };
 
-                // Accept connections. Spawn a task per connection, with a
-                // semaphore limiting concurrency to max_workers (best-effort
-                // since tokio tasks are lightweight, we just spawn directly).
+                // Accept connections. Spawn a task per connection, gated by
+                // the max_inflight semaphore above (when set); tokio tasks
+                // are lightweight, so there is no separate worker pool.
                 loop {
                     let (stream, peer) = match listener.accept().await {
                         Ok((s, p)) => (s, p),
