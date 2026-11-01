@@ -4,7 +4,12 @@
 //! bins stay thin. The load generator itself (Task 4) will build on this
 //! module as well.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use crate::client::YarClient;
+use crate::error::{YarError, YarResult};
+use crate::pack::Packager;
+use crate::response::YarResponse;
 
 /// Split `s` at the start of its trailing ASCII-alphabetic suffix.
 ///
@@ -101,6 +106,340 @@ pub fn percentile(sorted: &[f64], pct: f64) -> f64 {
     }
     let frac = rank - lower as f64;
     sorted[lower] * (1.0 - frac) + sorted[upper] * frac
+}
+
+// -- Load generation ----------------------------------------------------------
+
+/// Upper bound for a single request body: 4 MiB. A configured stage whose
+/// `body_size` exceeds this value makes `run_profile` fail up front.
+pub const MAX_BODY: usize = 4 * 1024 * 1024;
+
+/// Default body-size ladder in bytes (256 B .. 4 M, ~4x steps).
+pub const DEFAULT_SIZES: [usize; 10] = [
+    256, 1_024, 4_096, 16_384, 65_536, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
+];
+
+/// Default VU (virtual user / concurrent connection) ladder.
+pub const DEFAULT_VUS: [usize; 7] = [10, 20, 40, 80, 160, 320, 640];
+
+/// Per-call socket timeout so a wedged server cannot hang a VU forever.
+const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause between consecutive stages, letting the previous stage's
+/// connections fully settle and the server drain. Not applied after the
+/// final stage.
+const QUIET_PERIOD: Duration = Duration::from_secs(1);
+
+/// configuration of one profiling run.
+pub struct ProfilerConfig {
+    pub host: String,
+    pub body_sizes: Vec<usize>,
+    pub vus: Vec<usize>,
+    pub step_time: Duration,
+}
+
+/// Result of one stage: one (body_size, vus) cell of the matrix.
+pub struct StageReport {
+    pub body_size: usize,
+    pub vus: usize,
+    /// Stage length in seconds (the configured step_time).
+    pub duration_s: f64,
+    /// Completed requests (ok + fail) per second.
+    pub qps: f64,
+    pub ok: u64,
+    pub fail: u64,
+    /// Latency percentiles of the OK samples, in milliseconds.
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub p999: f64,
+    /// First failure text observed in the stage ("" when none).
+    pub first_error: String,
+    /// Stage wall-clock window in epoch seconds (SystemTime).
+    pub start_ts: u64,
+    pub end_ts: u64,
+}
+
+/// Run the full profiling matrix: every body size x every VU level, one
+/// stage apiece, blocking until all of them are done.
+///
+/// # Errors
+///
+/// Returns an error before touching the network when configured body
+/// sizes exceed [`MAX_BODY`], or when `body_sizes`/`vus` is empty or
+/// contains a zero VU level.
+pub fn run_profile(cfg: &ProfilerConfig) -> YarResult<Vec<StageReport>> {
+    if cfg.body_sizes.is_empty() {
+        return Err(YarError::Connection(
+            "profiler: body_sizes must not be empty".into(),
+        ));
+    }
+    if cfg.vus.is_empty() {
+        return Err(YarError::Connection("profiler: vus must not be empty".into()));
+    }
+    if let Some(&v) = cfg.vus.iter().find(|&&v| v == 0) {
+        return Err(YarError::Connection(format!("profiler: VU level {} is zero", v)));
+    }
+    if let Some(&s) = cfg.body_sizes.iter().find(|&&s| s > MAX_BODY) {
+        return Err(YarError::Connection(format!(
+            "profiler: body size {} exceeds MAX_BODY {}",
+            s, MAX_BODY
+        )));
+    }
+
+    let mut reports = Vec::new();
+    for &body_size in &cfg.body_sizes {
+        for &vus in &cfg.vus {
+            // Quiet period before every stage but the first.
+            if !reports.is_empty() {
+                std::thread::sleep(QUIET_PERIOD);
+            }
+            reports.push(run_stage(cfg, body_size, vus));
+        }
+    }
+    Ok(reports)
+}
+
+/// One stage: `vus` worker threads each holding their own persistent
+/// `YarClient` and hammering `echo` until the stage deadline.
+fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport {
+    let body = std::sync::Arc::new(make_body(body_size));
+    let deadline = std::time::Instant::now() + cfg.step_time;
+    let start_ts = epoch_secs();
+
+    let (tx, rx) = std::sync::mpsc::channel::<ThreadOutcome>();
+    let mut handles = Vec::with_capacity(vus);
+    for _ in 0..vus {
+        let tx = tx.clone();
+        let body = std::sync::Arc::clone(&body);
+        let host = cfg.host.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut client = match YarClient::connect(&host) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(ThreadOutcome {
+                        ok: 0,
+                        fail: 0,
+                        latencies_ms: Vec::new(),
+                        first_error: Some(format!("connect failed: {}", e)),
+                    });
+                    return;
+                }
+            };
+            client.set_timeout(CALL_TIMEOUT);
+            client.set_persistent(true);
+
+            let mut outcome = ThreadOutcome {
+                ok: 0,
+                fail: 0,
+                latencies_ms: Vec::new(),
+                first_error: None,
+            };
+            while std::time::Instant::now() < deadline {
+                // One echo parameter: the shared deterministic body.
+                let mut p = Packager::new();
+                if let Err(e) = p.push_string(&body) {
+                    outcome.note_failure(format!("pack failed: {}", e));
+                    continue;
+                }
+                let t0 = std::time::Instant::now();
+                let result = client.call("echo", vec![p]);
+                let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                match validate_echo(&result, body_size, &body) {
+                    Ok(()) => {
+                        outcome.ok += 1;
+                        outcome.latencies_ms.push(latency_ms);
+                    }
+                    Err(msg) => outcome.note_failure(msg),
+                }
+            }
+            let _ = tx.send(outcome);
+        }));
+    }
+    drop(tx);
+
+    // Aggregate worker outcomes as they arrive.
+    let mut agg = ThreadOutcome {
+        ok: 0,
+        fail: 0,
+        latencies_ms: Vec::new(),
+        first_error: None,
+    };
+    for _ in 0..vus {
+        if let Ok(o) = rx.recv() {
+            agg.ok += o.ok;
+            agg.fail += o.fail;
+            agg.latencies_ms.extend(o.latencies_ms);
+            if agg.first_error.is_none() {
+                agg.first_error = o.first_error;
+            }
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let end_ts = epoch_secs();
+
+    agg.into_report(body_size, vus, cfg.step_time, start_ts, end_ts)
+}
+
+/// What one VU thread observed over its stage.
+struct ThreadOutcome {
+    ok: u64,
+    fail: u64,
+    latencies_ms: Vec<f64>,
+    first_error: Option<String>,
+}
+
+impl ThreadOutcome {
+    /// Record a failed sample, keeping only the first error text.
+    fn note_failure(&mut self, msg: String) {
+        self.fail += 1;
+        if self.first_error.is_none() {
+            self.first_error = Some(msg);
+        }
+    }
+
+    /// Turn raw counters into a [`StageReport`].
+    fn into_report(
+        self,
+        body_size: usize,
+        vus: usize,
+        step_time: Duration,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> StageReport {
+        let mut latencies = self.latencies_ms;
+        latencies.sort_by(f64::total_cmp);
+        let duration_s = step_time.as_secs_f64();
+        StageReport {
+            body_size,
+            vus,
+            duration_s,
+            qps: if duration_s > 0.0 {
+                (self.ok + self.fail) as f64 / duration_s
+            } else {
+                0.0
+            },
+            ok: self.ok,
+            fail: self.fail,
+            p50: percentile(&latencies, 50.0),
+            p95: percentile(&latencies, 95.0),
+            p99: percentile(&latencies, 99.0),
+            p999: percentile(&latencies, 99.9),
+            first_error: self.first_error.unwrap_or_default(),
+            start_ts,
+            end_ts,
+        }
+    }
+}
+
+/// Validate one `echo` response: zero status, retval = one-element array
+/// of bytes with the same length and matching head/tail against what was
+/// sent (`body_size` < 32 compares the whole body).
+fn validate_echo(
+    result: &YarResult<YarResponse>,
+    body_size: usize,
+    body: &[u8],
+) -> Result<(), String> {
+    let response = match result {
+        Ok(r) => r,
+        Err(e) => return Err(format!("call failed: {}", e)),
+    };
+    if response.get_status() != 0 {
+        return Err(format!(
+            "non-zero status {} (error {:?})",
+            response.get_status(),
+            response.get_error()
+        ));
+    }
+    let arr = response
+        .get_response()
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "retval is not an array".to_string())?;
+    if arr.len() != 1 {
+        return Err(format!(
+            "retval array has {} elements, expected 1",
+            arr.len()
+        ));
+    }
+    let echoed = arr[0]
+        .as_bytes()
+        .ok_or_else(|| "retval element is not bytes".to_string())?;
+    if echoed.len() != body_size {
+        return Err(format!(
+            "echoed body is {} bytes, expected {}",
+            echoed.len(),
+            body_size
+        ));
+    }
+    if echoed == body {
+        return Ok(());
+    }
+    if body_size < 32 {
+        return Err("echoed body differs from what was sent".into());
+    }
+    if echoed[..16] != body[..16] {
+        return Err("echoed body: first 16 bytes differ".into());
+    }
+    if echoed[body_size - 16..] != body[body_size - 16..] {
+        return Err("echoed body: last 16 bytes differ".into());
+    }
+    Err("echoed body differs from what was sent (middle bytes)".into())
+}
+
+/// Deterministic request body: byte `i` is `(i % 251) as u8`.
+fn make_body(body_size: usize) -> Vec<u8> {
+    (0..body_size).map(|i| (i % 251) as u8).collect()
+}
+
+/// Current time in epoch seconds (0 if the clock is before the epoch).
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// -- CSV rendering ------------------------------------------------------------
+
+/// CSV header: fixed 13-column contract shared with Task 8 run.sh.
+pub const CSV_HEADER: &str = "size_bytes,vus,duration_s,qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts";
+
+/// Quote a CSV field when it contains comma, double-quote, CR or LF,
+/// doubling any embedded double quotes.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Write stage reports as CSV (`CSV_HEADER` then one line per stage,
+/// each terminated by `\n`). The body size column is named `size_bytes`.
+pub fn write_csv(reports: &[StageReport], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(out, "{}", CSV_HEADER)?;
+    for r in reports {
+        writeln!(
+            out,
+            "{},{},{:.3},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{},{},{}",
+            r.body_size,
+            r.vus,
+            r.duration_s,
+            r.qps,
+            r.ok,
+            r.fail,
+            r.p50,
+            r.p95,
+            r.p99,
+            r.p999,
+            csv_field(&r.first_error),
+            r.start_ts,
+            r.end_ts,
+        )?;
+    }
+    Ok(())
 }
 
 // -- Tests --------------------------------------------------------------------
