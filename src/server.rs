@@ -71,15 +71,33 @@ enum Address {
 }
 
 /// Read exactly `n` bytes from the reader into a new Vec.
-async fn read_exact(reader: &mut (impl AsyncReadExt + Unpin), n: usize) -> YarResult<Vec<u8>> {
+/// Read exactly `n` bytes, applying `timeout` to each individual read.
+///
+/// This is an *idle* timeout, matching the C server's `YAR_READ_TIMEOUT`: a
+/// large body that keeps arriving is not cut off just because the whole
+/// request takes longer than `timeout` under load, but a peer that stops
+/// sending is.
+async fn read_exact_idle(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    n: usize,
+    timeout: Duration,
+) -> YarResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
-    reader.read_exact(&mut buf).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            YarError::Protocol(format!("unexpected EOF while reading {} bytes", n))
-        } else {
-            YarError::Io(e)
-        }
-    })?;
+    let mut filled = 0;
+    while filled < n {
+        let read = match tokio::time::timeout(timeout, reader.read(&mut buf[filled..])).await {
+            Err(_) => return Err(YarError::Timeout),
+            Ok(Ok(0)) => {
+                return Err(YarError::Protocol(format!(
+                    "unexpected EOF while reading {} bytes",
+                    n
+                )))
+            }
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => return Err(YarError::Io(e)),
+        };
+        filled += read;
+    }
     Ok(buf)
 }
 
@@ -378,12 +396,13 @@ async fn handle_connection_with_timeout<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    // Use tokio::time::timeout for each read cycle.
-    // We implement the loop ourselves so we can re-apply the timeout per request.
+    // One read cycle per request. The timeout is applied to each individual
+    // read (idle timeout), not to the whole header+body: under load a 4 MiB
+    // body legitimately takes longer than the timeout end to end.
     loop {
-        let result = tokio::time::timeout(read_timeout, async {
+        let result = async {
             // Read header
-            let header_bytes = read_exact(stream, HEADER_SIZE).await?;
+            let header_bytes = read_exact_idle(stream, HEADER_SIZE, read_timeout).await?;
 
             // Parse header
             let header = parse_header_from_wire(&header_bytes).map_err(|_| {
@@ -401,25 +420,24 @@ where
             }
 
             // Read body
-            let body_bytes = read_exact(stream, body_len).await?;
+            let body_bytes = read_exact_idle(stream, body_len, read_timeout).await?;
 
             Ok::<_, YarError>((header, is_persistent, Some(body_bytes)))
-        })
+        }
         .await;
 
         let (header, is_persistent, body_bytes) = match result {
-            Ok(Ok(v)) => v,
-            Ok(Err(YarError::InvalidMagic)) => {
+            Ok(v) => v,
+            Err(YarError::InvalidMagic) => {
                 logger::log_global(logger::LogLevel::Error, "Invalid magic number in header");
                 return Err(YarError::InvalidMagic);
             }
-            Ok(Err(e)) => {
-                logger::log_global(logger::LogLevel::Notice, &format!("Read error: {}", e));
+            Err(YarError::Timeout) => {
+                logger::log_global(logger::LogLevel::Notice, "Read timeout, closing connection");
                 return Ok(());
             }
-            Err(_) => {
-                // Timeout
-                logger::log_global(logger::LogLevel::Notice, "Read timeout, closing connection");
+            Err(e) => {
+                logger::log_global(logger::LogLevel::Notice, &format!("Read error: {}", e));
                 return Ok(());
             }
         };

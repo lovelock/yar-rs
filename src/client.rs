@@ -286,7 +286,16 @@ fn send_all(conn: &mut Connection, data: &[u8]) -> YarResult<()> {
             }
             Ok(n) => sent += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            // A blocking socket reports an expired SO_SNDTIMEO as WouldBlock;
+            // retrying would spin forever.
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(YarError::Timeout)
+            }
             Err(e) => return Err(YarError::Io(e)),
         }
     }
@@ -308,7 +317,17 @@ fn recv_exact(conn: &mut Connection, buf: &mut [u8]) -> YarResult<()> {
             }
             Ok(n) => received += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            // A blocking socket reports an expired SO_RCVTIMEO as WouldBlock;
+            // treating it as "retry" turned every timed-out call into an
+            // infinite spin (the profiler then could not count timeouts).
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(YarError::Timeout)
+            }
             Err(e) => return Err(YarError::Io(e)),
         }
     }
