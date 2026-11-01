@@ -1,0 +1,84 @@
+# Two-stage build for the C Yar benchmark image (yar-bench-c), built from the
+# ../yar-c sources. The build context is a temporary staging dir created by
+# profile/stage.sh (staged copy of yar-c + profile/yar_echo_server.c +
+# profile/yar-entrypoint.sh); ../yar-c itself is READ-ONLY.
+#
+# ENTRYPOINT wraps the C server's daemonizer: the server runs non-standalone
+# (no -X) so -n N forks master + N workers, but the daemonizer's parent exits,
+# so the wrapper keeps the container's PID 1 alive with `exec sleep infinity`.
+FROM docker.io/library/almalinux:latest AS builder
+
+# System repos -> Aliyun (upstream mirrorlist default would leave CN slow/blocked).
+RUN sed -i \
+      -e 's|^mirrorlist=|#mirrorlist=|g' \
+      -e 's|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g' \
+      -e 's|^# baseurl=https://vault.almalinux.org|baseurl=https://mirrors.aliyun.com/almalinux|g' \
+      /etc/yum.repos.d/almalinux*.repo \
+    && dnf -q makecache && dnf clean all
+
+RUN dnf -y install gcc make cmake tar curl libevent-devel autoconf automake libtool \
+    && dnf clean all
+
+# msgpack-c C library (EL10 has no msgpack-devel; note c-* tags are the C lib,
+# cpp-* are the separate C++ one). CMake install is forced into lib/ so the
+# configure probe (hardcoded $dir/lib), the linker symlink, and ldconfig all
+# agree.
+RUN curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL https://github.com/msgpack/msgpack-c/archive/refs/tags/c-7.0.0.tar.gz \
+        -o /tmp/msgpack-c.tar.gz \
+    && tar -xzf /tmp/msgpack-c.tar.gz -C /tmp \
+    && cmake -S /tmp/msgpack-c-c-7.0.0 -B /tmp/msgpack-build \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
+        -DMSGPACK_BUILD_EXAMPLES=OFF -DMSGPACK_BUILD_TESTS=OFF \
+    && cmake --build /tmp/msgpack-build -j"$(nproc)" \
+    && cmake --install /tmp/msgpack-build \
+    && ln -sf libmsgpack-c.so /usr/local/lib/libmsgpackc.so \
+    && ldconfig
+
+COPY yar-c /src/yar-c
+COPY yar_echo_server.c /src/
+COPY yar-entrypoint.sh /usr/local/bin/yar-entrypoint
+RUN chmod 755 /usr/local/bin/yar-entrypoint
+
+# Mark the shipped generated autotools files as up-to-date so `make` skips the
+# maintainer-mode regeneration (would need the pinned aclocal-1.15; EL10 ships
+# automake 1.16+ only).
+RUN cd /src/yar-c \
+    && touch aclocal.m4 configure Makefile.in config.h.in \
+    && ./configure --with-msgpack=/usr/local --with-event=/usr \
+    && make -j"$(nproc)" \
+    && make install \
+    && echo /usr/local/lib > /etc/ld.so.conf.d/local.conf \
+    && ldconfig
+
+# Compile the echo server against the installed headers/libs.
+#   (-I/src/yar-c for yar.h; -lmsgpackc resolves via the libmsgpackc.so symlink,
+#    its NEEDED soname stays the versioned libmsgpack-c.so.* that the runtime
+#    stage copies.)
+RUN gcc -O2 -o /usr/local/bin/yar-server-c /src/yar_echo_server.c \
+        -I/usr/local/include -I/src/yar-c \
+        -L/usr/local/lib -lyar -levent -lmsgpackc -lpthread -lm
+
+FROM docker.io/library/almalinux:latest
+
+# System repos -> Aliyun (kept consistent with the builder stage).
+RUN sed -i \
+      -e 's|^mirrorlist=|#mirrorlist=|g' \
+      -e 's|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g' \
+      -e 's|^# baseurl=https://vault.almalinux.org|baseurl=https://mirrors.aliyun.com/almalinux|g' \
+      /etc/yum.repos.d/almalinux*.repo \
+    && dnf -q makecache && dnf clean all
+
+# /usr/local/lib is not on EL10's default ld.so search path — register it
+# before ldconfig so the copied shared libraries resolve at runtime.
+RUN dnf -y install libevent libgcc \
+    && dnf clean all \
+    && echo /usr/local/lib > /etc/ld.so.conf.d/local.conf
+
+COPY --from=builder /usr/local/bin/yar-server-c /usr/local/bin/yar-server-c
+COPY --from=builder /usr/local/bin/yar-entrypoint /usr/local/bin/yar-entrypoint
+COPY --from=builder /usr/local/lib/libyar.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libmsgpack-c.so* /usr/local/lib/
+
+RUN ldconfig
+
+ENTRYPOINT ["/usr/local/bin/yar-entrypoint"]
