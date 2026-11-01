@@ -70,6 +70,7 @@ pub mod logger;
 pub mod client;
 pub mod server;
 pub mod error;
+pub mod profiler;
 
 pub use protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING, PROTOCOL_LIST};
 pub use pack::{Packager, Unpackager, YarData, YarDataType};
