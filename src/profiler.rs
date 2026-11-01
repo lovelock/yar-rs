@@ -366,6 +366,14 @@ fn validate_echo(
     let echoed = arr[0]
         .as_bytes()
         .ok_or_else(|| "retval element is not bytes".to_string())?;
+    verify_echo(body_size, body, echoed)
+}
+
+/// Echo-fidelity check for one sample: length must equal `body_size`;
+/// bodies below 32 bytes are compared whole, larger ones only by their
+/// first and last 16 bytes (the hot path must not scan the middle of a
+/// 4 MiB body).
+fn verify_echo(body_size: usize, sent: &[u8], echoed: &[u8]) -> Result<(), String> {
     if echoed.len() != body_size {
         return Err(format!(
             "echoed body is {} bytes, expected {}",
@@ -373,19 +381,19 @@ fn validate_echo(
             body_size
         ));
     }
-    if echoed == body {
-        return Ok(());
-    }
     if body_size < 32 {
+        if echoed == sent {
+            return Ok(());
+        }
         return Err("echoed body differs from what was sent".into());
     }
-    if echoed[..16] != body[..16] {
+    if echoed[..16] != sent[..16] {
         return Err("echoed body: first 16 bytes differ".into());
     }
-    if echoed[body_size - 16..] != body[body_size - 16..] {
+    if echoed[body_size - 16..] != sent[body_size - 16..] {
         return Err("echoed body: last 16 bytes differ".into());
     }
-    Err("echoed body differs from what was sent (middle bytes)".into())
+    Ok(())
 }
 
 /// Deterministic request body: byte `i` is `(i % 251) as u8`.
@@ -470,6 +478,47 @@ mod tests {
     fn percentile_empty_and_single() {
         assert_eq!(percentile(&[], 99.0), 0.0);
         assert_eq!(percentile(&[7.5], 99.0), 7.5);
+    }
+
+    // -- echo fidelity ---------------------------------------------------------
+
+    #[test]
+    fn verify_echo_large_body_ignores_middle_bytes() {
+        let body = make_body(65_536);
+        let mut echoed = body.clone();
+        // Middle byte differs, ends are identical: still accepted.
+        echoed[32_000] ^= 0xff;
+        assert_eq!(verify_echo(65_536, &body, &echoed), Ok(()));
+    }
+
+    #[test]
+    fn verify_echo_large_body_tail_mismatch_is_rejected() {
+        let body = make_body(65_536);
+        let mut echoed = body.clone();
+        echoed[65_535] ^= 0xff;
+        let err = verify_echo(65_536, &body, &echoed).unwrap_err();
+        assert!(err.contains("last 16 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_echo_small_body_compares_whole() {
+        let body = make_body(16);
+        assert_eq!(verify_echo(16, &body, &body), Ok(()));
+        // One middle byte differs: whole-body comparison must reject.
+        let mut echoed = body.clone();
+        echoed[7] ^= 0xff;
+        let err = verify_echo(16, &body, &echoed).unwrap_err();
+        assert!(err.contains("differs"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_echo_length_mismatch_is_rejected() {
+        let body = make_body(64);
+        let (short, long) = (&body[..63], &body[..64]);
+        let err1 = verify_echo(64, &body, short).unwrap_err();
+        assert!(err1.contains("63 bytes, expected 64"), "got: {err1}");
+        let err2 = verify_echo(64, &body, [long, long].concat().as_slice()).unwrap_err();
+        assert!(err2.contains("128 bytes, expected 64"), "got: {err2}");
     }
 
     // -- sizes ----------------------------------------------------------------
