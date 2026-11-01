@@ -3,7 +3,27 @@
 # the profiler is selected via `podman run --entrypoint /usr/local/bin/profiler`.
 FROM docker.io/library/almalinux:latest AS builder
 
+# System repos -> Aliyun (upstream mirrorlist default would leave CN slow/blocked).
+RUN sed -i \
+      -e 's|^mirrorlist=|#mirrorlist=|g' \
+      -e 's|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g' \
+      -e 's|^# baseurl=https://vault.almalinux.org|baseurl=https://mirrors.aliyun.com/almalinux|g' \
+      /etc/yum.repos.d/almalinux*.repo \
+    && dnf -q makecache && dnf clean all
+
 RUN dnf -y install rust cargo && dnf clean all
+
+# Cargo deps -> USTC sparse index (mirrors must be baked into the image,
+# never rely on the host's proxy/mirror config).
+ENV CARGO_HOME=/root/.cargo
+RUN mkdir -p "$CARGO_HOME" && \
+    printf '%s\n' \
+      '[source.crates-io]' \
+      'replace-with = "ustc"' \
+      '' \
+      '[source.ustc]' \
+      'registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"' \
+      > "$CARGO_HOME/config.toml"
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -13,6 +33,14 @@ COPY src ./src
 RUN cargo build --release --locked --bin yar-server-rust --bin profiler
 
 FROM docker.io/library/almalinux:latest
+
+# System repos -> Aliyun (kept consistent with the builder stage).
+RUN sed -i \
+      -e 's|^mirrorlist=|#mirrorlist=|g' \
+      -e 's|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g' \
+      -e 's|^# baseurl=https://vault.almalinux.org|baseurl=https://mirrors.aliyun.com/almalinux|g' \
+      /etc/yum.repos.d/almalinux*.repo \
+    && dnf -q makecache && dnf clean all
 
 RUN dnf -y install libgcc && dnf clean all
 
