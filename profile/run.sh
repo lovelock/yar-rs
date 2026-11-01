@@ -209,8 +209,11 @@ poller() {
 	while true; do
 		local ts cpu mem
 		ts=$(date +%s.%N)
-		cpu=$(awk '$1=="usage_usec" { print $2; exit }' "$path_cpu" 2>/dev/null)
-		mem=$(cat "$path_mem" 2>/dev/null)
+		# `|| true` matters: with `set -e` a failing read would kill this
+		# subshell on the first miss, leaving the run without samples and
+		# without an abort. Failures must reach the counter below.
+		cpu=$(awk '$1=="usage_usec" { print $2; exit }' "$path_cpu" 2>/dev/null || true)
+		mem=$(cat "$path_mem" 2>/dev/null || true)
 		if [ -n "$cpu" ] && [ -n "$mem" ]; then
 			printf '%s,%s,%s\n' "$ts" "$cpu" "$mem" >>"$CG_CSV"
 			fails=0
@@ -220,6 +223,10 @@ poller() {
 				echo "run.sh: cgroup poll failed $fails consecutive times ($path_cpu | $path_mem)" >&2
 				echo "run.sh: aborting run; intermediates kept in $OUT_DIR for debugging" >&2
 				touch "$OUT_DIR/.poll-abort"
+				# Bash defers a trap until the foreground command finishes, so
+				# signalling alone would let the whole benchmark run to the end
+				# before aborting. Stop the profiler container first.
+				podman kill "$PROF" >/dev/null 2>&1 || true
 				kill -INT $$ # $$ = main shell pid, even inside a background subshell
 				return 0
 			fi
@@ -269,6 +276,7 @@ if [ "$ready" != 1 ]; then
 fi
 echo "[2/4] server ready on 127.0.0.1:$PORT; host-side cgroup poller -> $CG_CSV"
 
+: >"$CG_CSV" # exists even if the very first sample fails (merge guard)
 poller &
 POLL_PID=$!
 sleep 0.3 # let the poller record a first sample before load starts
@@ -344,7 +352,10 @@ REPORT="$OUT_DIR/report-$TARGET-$(date +%s).csv"
 TMP_REPORT="$OUT_DIR/.report-$TARGET-$$.csv"
 
 awk -F',' -v cpus="$CPUS" '
-NR == FNR {
+# Select the cgroup file by name, not by NR == FNR: with an empty first file
+# the two counters stay equal and every profiler row would be parsed as a
+# cgroup sample.
+FILENAME == ARGV[1] {
 	n++
 	ts[n] = $1 + 0
 	cpu[n] = $2 + 0
@@ -429,10 +440,11 @@ FNR == 1 {
 	next
 }
 {
-	# first_error (field 11) may contain commas; columns after it shift.
+	# first_error (field 11) may contain commas, so only the columns after
+	# it shift (p50..p999 are fields 7-10, i.e. before it).
 	sh = NF - 15
 	printf "%-9s %-5s %-11s %-8s %-5s %-8s %-8s %-8s %-8s %-7s %.1f\n",
-		$1, $2, $4, $5, $6, $(7 + sh), $(8 + sh), $(9 + sh), $(10 + sh), $(14 + sh), $(15 + sh) / 1048576
+		$1, $2, $4, $5, $6, $7, $8, $9, $10, $(14 + sh), $(15 + sh) / 1048576
 }
 ' "$REPORT"
 echo

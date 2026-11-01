@@ -122,54 +122,57 @@ workers' worth of parallelism on a 2-CPU quota. If you pass an explicit
 `--inflight N`) — but note the caveat above: explicit small values will
 starve the high-VU stages.
 
-The profiler container itself gets more memory (`4g`). At `4m × 640` the
+The profiler container itself gets more memory (`6g`). At `4m × 640` the
 load generator holds a full copy of every body per VU and is OOM-killed
 under 2 GB; the server under test keeps the mandated 2 GB.
 
 ## Sample results
 
 One `--matrix quick` run per target on the same machine (2 CPU / 2 GB per
-container, `--network=host`, 10 s per stage, Rust server `--inflight 0`,
-C server `-n 2`). Both runs completed with no leaked containers.
+server container, `--network=host`, 10 s per stage, Rust server
+`--inflight 0`, C server `-n 2`):
 
 | body | VUs | Rust QPS | C QPS | Rust p99 ms | C p99 ms | Rust cpu% | C cpu% | Rust mem | C mem | Rust fail | C fail |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1k | 10 | 183,721 | 99,408 | 0.09 | 0.15 | 66 | 84 | 3M | 99M | 0 | 0 |
-| 1k | 40 | 154,685 | 93,485 | 0.33 | 0.49 | 56 | 77 | 3M | 189M | 0 | 0 |
-| 1k | 160 | 154,986 | 96,047 | 2.31 | 2.19 | 59 | 82 | 4M | 282M | 0 | 0 |
-| 1k | 640 | 156,084 | 93,116 | 24.34 | 8.28 | 62 | 79 | 8M | 379M | 0 | 0 |
-| 64k | 10 | 25,113 | 15,332 | 0.64 | 0.93 | 84 | 89 | 4M | 391M | 0 | 0 |
-| 64k | 40 | 25,087 | 14,162 | 2.44 | 3.58 | 86 | 88 | 6M | 410M | 0 | 0 |
-| 64k | 160 | 22,321 | 11,064 | 11.20 | 16.09 | 89 | 85 | 14M | 441M | 0 | 0 |
-| 64k | 640 | 22,941 | 11,940 | 60.11 | 58.21 | 85 | 87 | 49M | 537M | 0 | 0 |
-| 1m | 10 | 1,317 | 734 | 12.83 | 19.83 | 86 | 87 | 29M | 467M | 0 | 0 |
-| 1m | 40 | 375 | 460 | 206.76 | 194.63 | 24 | 49 | 60M | 562M | 0 | 0 |
-| 1m | 160 | 329 | 372 | 1702.06 | 1518.15 | 20 | 39 | 82M | 554M | 0 | 2 |
-| 1m | 640 | 367 | 363 | 4099.33 | 3193.50 | 18 | 30 | 123M | 539M | 537 | 342 |
-| 4m | 10 | 82 | 90 | 203.10 | 202.32 | 29 | 38 | 144M | 563M | 0 | 0 |
-| 4m | 40 | 55 | 58 | 1406.91 | 1606.14 | 16 | 19 | 189M | 717M | 0 | 0 |
-| 4m | 160 | 64 | 74 | 5714.79 | 4145.37 | 13 | 13 | 437M | 847M | 39 | 272 |
-| 4m | 640 | 66 | 85 | 6713.21 | 6351.66 | 14 | 11 | 482M | 887M | 37 | 402 |
+| 1k | 10 | 189,996 | 97,788 | 0.09 | 0.14 | 73 | 82 | 3M | 95M | 0 | 0 |
+| 1k | 40 | 172,843 | 91,183 | 0.34 | 0.52 | 64 | 77 | 3M | 183M | 0 | 0 |
+| 1k | 160 | 159,019 | 95,510 | 1.99 | 2.10 | 61 | 80 | 5M | 276M | 0 | 0 |
+| 1k | 640 | 146,479 | 62,364 | 27.96 | 9.56 | 52 | 56 | 9M | 342M | 0 | 0 |
+| 64k | 10 | 24,513 | 15,298 | 0.70 | 0.85 | 86 | 88 | 4M | 355M | 0 | 0 |
+| 64k | 40 | 23,466 | 14,089 | 2.79 | 3.31 | 86 | 88 | 6M | 373M | 0 | 0 |
+| 64k | 160 | 22,024 | 10,968 | 11.39 | 15.68 | 83 | 85 | 15M | 410M | 0 | 0 |
+| 64k | 640 | 10,962 | 11,988 | 111.50 | 56.31 | 49 | 88 | 49M | 498M | 0 | 0 |
+| 1m | 10 | 1,218 | 747 | 13.48 | 14.85 | 87 | 87 | 32M | 425M | 0 | 0 |
+| 1m | 40 | 373 | 457 | 206.20 | 192.67 | 23 | 51 | 71M | 523M | 0 | 0 |
+| 1m | 160 | 334 | 393 | 1590.95 | 1806.89 | 19 | 38 | 73M | 521M | 0 | 256 |
+| 1m | 640 | 343 | 393 | 4733.59 | 3200.25 | 19 | 31 | 136M | 521M | 58 | 392 |
+| 4m | 10 | 84 | 82 | 204.50 | 201.04 | 29 | 34 | 157M | 519M | 0 | 0 |
+| 4m | 40 | 57 | 54 | 1589.73 | 1951.28 | 16 | 19 | 166M | 590M | 0 | 0 |
+| 4m | 160 | 62 | 75 | 4597.45 | 4485.53 | 14 | 12 | 379M | 903M | 16 | 331 |
+| 4m | 640 | 66 | 82 | 6214.97 | 5099.48 | 14 | 10 | 527M | 783M | 58 | 410 |
 
 Reading the table:
 
-- **Small bodies (≤64k):** Rust is ~1.6–2.2× the C QPS at every VU level —
+- **Small bodies (≤64k):** Rust reaches ~1.6–1.9× the C QPS at 10–160 VUs —
   the C server pays more per-request overhead (unpack/zone/pack round trip).
+  At 64k×640 both saturate and land at ~11–12k QPS.
 - **Large bodies (≥1m):** the two converge; C is slightly ahead at 4m, where
-  the Rust path copies the body through the packager.
+  the Rust path copies every body through the packager.
 - **Memory:** C's pre-forked workers hold per-connection buffers and stay in
-  the hundreds of MB; Rust's footprint tracks the in-flight bodies (and the
-  probe at 4m×640 stays under the 2 GB cap).
-- **CPU:** at ≥1m the server is not the bottleneck — the 2-CPU load generator
-  cannot feed 160–640 clients with multi-MB bodies fast enough, which is why
-  `cpu%` drops to 10–30 % while QPS flattens.
-- **Top-right corner:** `1m×640`, `4m×160`, `4m×640` show `Broken pipe`
-  failures on both sides. The server closes connections that stay idle for
-  its 5 s read timeout while the starved load generator is still producing
-  the request; this is a limit of the 2-CPU measuring rig, not of the RPC
-  path. The full matrix shows the same rows with `--step-time 10s`; treat
-  them as "not measurable here" rather than as a server result.
+  the 95–900 MB range; Rust's footprint tracks the in-flight bodies
+  (3–527 MB) and stays well under the 2 GB cap.
+- **CPU:** at ≥1m the server is not the bottleneck — the 2-CPU load
+  generator cannot feed 160–640 clients with multi-MB bodies fast enough,
+  which is why `cpu%` drops to 10–38 % while QPS flattens.
+- **Top-right corner:** every row with failures ends with `Broken pipe`:
+  the server closes a connection that stays idle for its 5 s read timeout
+  while the starved load generator is still producing the request. At
+  160–640 VUs × 1–4 MB the C server loses far more connections (256–410)
+  than the Rust one (16–58); with `-n 2` the C side has only two event-loop
+  workers to drain 640 multi-MB clients. This is a limit of the 2-CPU
+  measuring rig plus this worker configuration, not a verdict on the RPC
+  path — treat those rows as "not measurable here" rather than as a
+  server-capacity result.
 - These are single runs on a shared workstation (a few percent run-to-run
-  variance, more at the 1m/4m corners). Re-run `--matrix full` for a real
-  curve.
-
+  variance, more at the 1m/4m corners, and p99.9 is noisy). Re-run
+  `--matrix full` — ideally a few times — for a real curve.
