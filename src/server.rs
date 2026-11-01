@@ -70,6 +70,23 @@ enum Address {
     Unix(String),
 }
 
+/// True when a read failure means the peer went away rather than a malformed
+/// or truncated request: a clean close before the first byte, a reset, or a
+/// broken pipe. Those are routine and logged at DEBUG.
+fn is_peer_close(err: &YarError) -> bool {
+    match err {
+        // read_exact_idle uses Connection only for "closed before a byte".
+        YarError::Connection(_) => true,
+        YarError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
+}
+
 /// Read exactly `n` bytes, applying `timeout` to each individual read.
 ///
 /// This is an *idle* timeout, matching the C server's `YAR_READ_TIMEOUT`: a
@@ -87,10 +104,16 @@ async fn read_exact_idle(
         let read = match tokio::time::timeout(timeout, reader.read(&mut buf[filled..])).await {
             Err(_) => return Err(YarError::Timeout),
             Ok(Ok(0)) => {
+                if filled == 0 {
+                    // Closed before the first byte: a health check, a port
+                    // probe, or a client dropping an idle keep-alive
+                    // connection. Not a protocol error.
+                    return Err(YarError::Connection("peer closed the connection".into()));
+                }
                 return Err(YarError::Protocol(format!(
                     "unexpected EOF while reading {} bytes",
                     n
-                )))
+                )));
             }
             Ok(Ok(k)) => k,
             Ok(Err(e)) => return Err(YarError::Io(e)),
@@ -433,6 +456,15 @@ where
             }
             Err(YarError::Timeout) => {
                 logger::log_global(logger::LogLevel::Notice, "Read timeout, closing connection");
+                return Ok(());
+            }
+            Err(ref e) if is_peer_close(e) => {
+                // Routine: the peer went away (health check, probe, client
+                // dropping a persistent connection). Nothing to report.
+                logger::log_global(
+                    logger::LogLevel::Debug,
+                    "Connection closed by peer before a request",
+                );
                 return Ok(());
             }
             Err(e) => {
