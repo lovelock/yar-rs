@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -38,6 +38,7 @@ pub struct YarServer {
     handlers: Arc<RwLock<HashMap<String, YarHandler>>>,
     max_workers: usize,
     max_request_size: usize,
+    max_inflight: usize,
     stand_alone: bool,
     read_timeout: Duration,
     log_file: Option<String>,
@@ -173,6 +174,7 @@ impl YarServer {
             handlers: Arc::new(RwLock::new(HashMap::new())),
             max_workers: 1,
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
+            max_inflight: 0,
             stand_alone: true,
             read_timeout: Duration::from_secs(3),
             log_file: None,
@@ -218,6 +220,15 @@ impl YarServer {
     /// excessive memory allocation. Defaults to 8 MiB.
     pub fn set_max_request_size(&mut self, bytes: usize) {
         self.max_request_size = bytes;
+    }
+
+    /// Bounds the number of concurrently served connections.
+    ///
+    /// Beyond the limit, the accept loop blocks until a permit is released
+    /// (a connection task returns) — connections wait rather than being
+    /// rejected. `0` (the default) disables the limit.
+    pub fn set_max_inflight(&mut self, n: usize) {
+        self.max_inflight = n;
     }
 
     /// Sets the per-request read timeout.
@@ -287,7 +298,17 @@ impl YarServer {
                 let handlers = self.handlers.clone();
                 let read_timeout = self.read_timeout;
                 let max_request_size = self.max_request_size;
-                let _max_workers = self.max_workers;
+                let max_inflight = self.max_inflight;
+
+                // Concurrency gate: at most `max_inflight` connections are
+                // served at once; 0 means unlimited. A permit is acquired in
+                // the accept loop (never rejected) and moved into the
+                // connection task, released when the task returns.
+                let semaphore = if max_inflight >= 1 {
+                    Some(Arc::new(Semaphore::new(max_inflight)))
+                } else {
+                    None
+                };
 
                 // Accept connections. Spawn a task per connection, with a
                 // semaphore limiting concurrency to max_workers (best-effort
@@ -311,8 +332,22 @@ impl YarServer {
 
                     let handlers = handlers.clone();
 
+                    // Block here while saturated: a permit frees when an
+                    // older connection task finishes. (The semaphore is never
+                    // closed, so acquire cannot fail.)
+                    let permit = match &semaphore {
+                        Some(sem) => Some(
+                            sem.clone()
+                                .acquire_owned()
+                                .await
+                                .expect("inflight semaphore closed"),
+                        ),
+                        None => None,
+                    };
+
                     tokio::spawn(async move {
                         let mut stream = stream;
+                        let _permit = permit; // released when this task returns
                         // Apply read timeout per-request inside handle_connection
                         let _ = handle_connection_with_timeout(
                             &mut stream,

@@ -6,7 +6,9 @@
 //! for the body.
 
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use byteorder::{BigEndian, ByteOrder};
 
 use yar_rs::*;
 
@@ -225,4 +227,118 @@ fn test_request_within_limit_still_served() {
     assert_eq!(retval.as_str(), Some("echo:ok"));
 
     client.close();
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency gate: set_max_inflight bounds concurrently served connections
+// ---------------------------------------------------------------------------
+
+/// Helper: build a raw Yar wire request (as the C client would produce it,
+/// see test_cross_language): 82-byte big-endian header + packager name +
+/// packed request body.
+fn build_raw_request(id: u32, persistent: bool) -> Vec<u8> {
+    let req = YarRequest::new(id as u64, "echo");
+    let req_msgpack = req.pack(0).unwrap();
+
+    let body: Vec<u8> = {
+        let mut out = Vec::with_capacity(PACKAGER_NAME.len() + req_msgpack.len());
+        out.extend_from_slice(PACKAGER_NAME.as_slice());
+        out.extend_from_slice(&req_msgpack);
+        out
+    };
+
+    let mut header_bytes = vec![0u8; HEADER_SIZE];
+    BigEndian::write_u32(&mut header_bytes[0..4], id);              // id
+    BigEndian::write_u16(&mut header_bytes[4..6], 0);              // version
+    BigEndian::write_u32(&mut header_bytes[6..10], PROTOCOL_MAGIC); // magic
+    let reserved = if persistent { PROTOCOL_PERSISTENT } else { 0 };
+    BigEndian::write_u32(&mut header_bytes[10..14], reserved);     // reserved
+    // provider[14..46] stays zeroed
+    // token[46..78] stays zeroed
+    BigEndian::write_u32(&mut header_bytes[78..82], body.len() as u32); // body_len
+
+    let mut packet = header_bytes;
+    packet.extend_from_slice(&body);
+    packet
+}
+
+#[test]
+fn test_max_inflight_gates_concurrent_connections() {
+    let port = find_available_port();
+    let addr = format!("127.0.0.1:{}", port);
+
+    let _server_thread = start_server(port, |server| {
+        Box::pin(async move {
+            server.set_max_inflight(1);
+            server.register_handler("echo", |req| {
+                let mut pk = Packager::new();
+                pk.push_string(b"echo:ok").unwrap();
+                YarResponse::success(req.id(), pk)
+            }).await;
+        })
+    });
+
+    wait_for_port(port);
+
+    // conn1: a persistent connection. Its request is served and it then
+    // idles inside the serve loop, holding the single inflight permit
+    // until we deliberately close it.
+    let mut conn1 = std::net::TcpStream::connect(&addr).unwrap();
+    conn1.write_all(&build_raw_request(101, true)).unwrap();
+    conn1.flush().unwrap();
+
+    // Give the server time to accept conn1, serve its request and park in
+    // the persistent serve loop while still holding the permit.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // conn2: also persistent. Its request must wait (not be served) while
+    // conn1 holds the only permit.
+    let mut conn2 = std::net::TcpStream::connect(&addr).unwrap();
+    conn2.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    conn2.write_all(&build_raw_request(102, true)).unwrap();
+    conn2.flush().unwrap();
+
+    let not_served_start = Instant::now();
+    let mut probe = [0u8; HEADER_SIZE];
+    match conn2.read(&mut probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut => {}
+        other => panic!(
+            "conn2 was served while conn1 held the only permit ({}ms elapsed; read result: {:?})",
+            not_served_start.elapsed().as_millis(),
+            other
+        ),
+    }
+
+    // Release conn1's permit and assert conn2 is then served within 2s.
+    drop(conn1);
+
+    let served_deadline = Instant::now() + Duration::from_secs(2);
+    conn2.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut received = Vec::new();
+    loop {
+        if Instant::now() >= served_deadline {
+            panic!(
+                "conn2 was not served within 2s after conn1 closed (received {} bytes)",
+                received.len()
+            );
+        }
+        match conn2.read(&mut probe) {
+            Ok(n) => {
+                received.extend_from_slice(&probe[..n]);
+                if received.len() >= HEADER_SIZE {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => panic!("conn2 read failed while waiting to be served: {:?}", e),
+        }
+    }
+
+    assert!(
+        received.len() >= HEADER_SIZE,
+        "expected at least a response header for conn2, got {} bytes",
+        received.len()
+    );
 }
