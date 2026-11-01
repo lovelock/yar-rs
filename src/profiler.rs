@@ -78,11 +78,60 @@ pub fn parse_duration_suffix(s: &str) -> Result<Duration, String> {
     }
 }
 
+/// Return the `pct`-percentile of an ascending slice with linear
+/// interpolation (k6-style), i.e. value at continuous rank
+/// `(pct / 100) * (len - 1)` between its neighbouring elements.
+///
+/// `sorted` must be in ascending order (this is not checked). `pct` is
+/// clamped to [0, 100]. An empty slice yields `0.0`; a single-element
+/// slice yields that element.
+pub fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let pct = pct.clamp(0.0, 100.0);
+    let rank = (pct / 100.0) * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if upper == lower {
+        return sorted[lower];
+    }
+    let frac = rank - lower as f64;
+    sorted[lower] * (1.0 - frac) + sorted[upper] * frac
+}
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- percentile -------------------------------------------------------------
+
+    #[test]
+    fn percentile_ramp_matches_linear_interpolation() {
+        let v: Vec<f64> = (1..=1000).map(|x| x as f64).collect();
+        assert!((percentile(&v, 50.0) - 500.5).abs() < 1e-9);
+        assert!((percentile(&v, 95.0) - 950.05).abs() < 1e-9);
+        assert!((percentile(&v, 99.0) - 990.01).abs() < 1e-9);
+        assert!((percentile(&v, 99.9) - 999.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percentile_clamps_out_of_range() {
+        let v = [1.0, 2.0, 3.0];
+        assert_eq!(percentile(&v, 150.0), 3.0);
+        assert_eq!(percentile(&v, -1.0), 1.0);
+    }
+
+    #[test]
+    fn percentile_empty_and_single() {
+        assert_eq!(percentile(&[], 99.0), 0.0);
+        assert_eq!(percentile(&[7.5], 99.0), 7.5);
+    }
 
     // -- sizes ----------------------------------------------------------------
 
