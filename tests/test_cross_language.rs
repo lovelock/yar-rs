@@ -13,14 +13,6 @@ use yar_rs::*;
 // Wire-level cross-language verification
 // ---------------------------------------------------------------------------
 
-/// Helper: safely read a u32 from a packed YarHeader field.
-macro_rules! packed_u32 {
-    ($h:expr, $field:ident) => {{
-        let h = &$h;
-        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-    }};
-}
-
 #[test]
 fn test_cross_language_wire_format_compatibility() {
     // This test verifies wire format compatibility without needing a running C server.
@@ -56,9 +48,9 @@ fn test_cross_language_wire_format_compatibility() {
     // 2. Verify the Rust server-side code can parse this C-produced packet
     // Parse header
     let header = YarHeader::from_bytes(&wire_request[..HEADER_SIZE]).unwrap();
-    assert_eq!(packed_u32!(header, id), 1000);
-    assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(header, body_len) as usize, PACKAGER_NAME.len() + msgpack_body.len());
+    assert_eq!(header.id, 1000);
+    assert_eq!(header.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(header.body_len as usize, PACKAGER_NAME.len() + msgpack_body.len());
 
     // Parse packager name
     let body_start = HEADER_SIZE;
@@ -92,8 +84,8 @@ fn test_cross_language_wire_format_compatibility() {
 
     // 4. Verify the response can be parsed back (as C client would)
     let resp_header = YarHeader::from_bytes(&resp_payload[..HEADER_SIZE]).unwrap();
-    assert_eq!(packed_u32!(resp_header, id), 1000);
-    assert_eq!(packed_u32!(resp_header, magic_num), PROTOCOL_MAGIC);
+    assert_eq!(resp_header.id, 1000);
+    assert_eq!(resp_header.magic_num, PROTOCOL_MAGIC);
 
     let resp_body = &resp_payload[HEADER_SIZE + PACKAGER_NAME.len()..];
     let parsed_resp = YarResponse::unpack(resp_body, 0).unwrap();
@@ -113,9 +105,7 @@ fn test_cross_language_header_byte_compatibility() {
     header.render(42, Some("RustClient"), None, 256, PROTOCOL_PERSISTENT);
 
     // Read raw struct bytes
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
 
     // C expects these fields in network byte order at these offsets:
     use byteorder::{BigEndian, ByteOrder};

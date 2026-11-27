@@ -12,14 +12,6 @@ use byteorder::{BigEndian, ByteOrder};
 
 use yar_rs::*;
 
-/// Helper: safely read a u32 from a packed YarHeader field.
-macro_rules! packed_u32 {
-    ($h:expr, $field:ident) => {{
-        let h = &$h;
-        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-    }};
-}
-
 /// Helper: bind to port 0 to find an available port, then release it.
 fn find_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -184,7 +176,7 @@ fn test_oversized_request_rejected_before_reading_body() {
     // Parse the response header and body (via unaligned reads — YarHeader is packed)
     let header = YarHeader::from_bytes(&raw[..HEADER_SIZE]).unwrap();
     let body = &raw[HEADER_SIZE..];
-    assert_eq!(packed_u32!(header, id), 42);
+    assert_eq!(header.id, 42);
 
     // Skip the PACKAGER_NAME prefix and unpack the response payload
     let response = YarResponse::unpack(body, PACKAGER_NAME.len()).unwrap();

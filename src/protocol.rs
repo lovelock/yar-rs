@@ -5,7 +5,8 @@
 //! the actual fields sum to 82 (4+2+4+4+32+32+4).
 
 use byteorder::{BigEndian, ByteOrder};
-use std::mem;
+
+use crate::error::{YarError, YarResult};
 
 /// Protocol flag: persistent connection
 pub const PROTOCOL_PERSISTENT: u32 = 0x1;
@@ -18,12 +19,19 @@ pub const PROTOCOL_LIST: u32 = 0x4;
 pub const PROTOCOL_MAGIC: u32 = 0x80DFEC60;
 
 /// Size of the packed header in bytes.
-/// Derived from the actual struct layout: id(4)+version(2)+magic(4)+reserved(4)+provider(32)+token(32)+body_len(4) = 82
-pub const HEADER_SIZE: usize = mem::size_of::<YarHeader>();
+/// id(4)+version(2)+magic(4)+reserved(4)+provider(32)+token(32)+body_len(4) = 82
+pub const HEADER_SIZE: usize = 82;
 
-/// Yar protocol header, matching the C `yar_header` struct exactly.
+// Keep the constant and the documented layout in sync.
+const _: () = assert!(HEADER_SIZE == 4 + 2 + 4 + 4 + 32 + 32 + 4);
+
+/// Yar protocol header, matching the C `yar_header` struct fields.
 ///
-/// Layout (packed, no padding):
+/// All numeric fields are stored in **host byte order**. Use [`to_bytes`] to
+/// produce wire format and [`from_bytes`] to parse it. This keeps the public
+/// type free of the packed/unaligned-field hazards of a direct C layout.
+///
+/// Layout on the wire (packed, no padding):
 ///   id:         4 bytes  (unsigned int)
 ///   version:    2 bytes  (unsigned short)
 ///   magic_num:  4 bytes  (unsigned int)
@@ -31,8 +39,7 @@ pub const HEADER_SIZE: usize = mem::size_of::<YarHeader>();
 ///   provider:  32 bytes  (unsigned char[32])
 ///   token:     32 bytes  (unsigned char[32])
 ///   body_len:   4 bytes  (unsigned int)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YarHeader {
     pub id: u32,
     pub version: u16,
@@ -57,11 +64,11 @@ impl YarHeader {
         }
     }
 
-    /// Render (populate) this header, matching `yar_protocol_render()` from C.
+    /// Render (populate) this header in host byte order, matching
+    /// `yar_protocol_render()` from C.
     ///
-    /// Sets id, magic_num, body_len, reserved in network byte order and copies
-    /// up to 16 bytes of provider and token (matching the C implementation which
-    /// only copies 16 bytes despite the 32-byte fields).
+    /// Provider and token copy at most 31 bytes and leave a trailing NUL,
+    /// matching C's `strncpy(..., sizeof(field))` + forced terminator.
     pub fn render(
         &mut self,
         id: u32,
@@ -70,127 +77,95 @@ impl YarHeader {
         body_len: u32,
         reserved: u32,
     ) {
-        self.magic_num = PROTOCOL_MAGIC.to_be();
-        self.id = id.to_be();
-        self.body_len = body_len.to_be();
-        self.reserved = reserved.to_be();
+        self.magic_num = PROTOCOL_MAGIC;
+        self.id = id;
+        self.body_len = body_len;
+        self.reserved = reserved;
 
-        self.provider = [0u8; 32];
-        if let Some(p) = provider {
-            let bytes = p.as_bytes();
-            let len = std::cmp::min(bytes.len(), 16);
-            self.provider[..len].copy_from_slice(&bytes[..len]);
-        }
-
-        self.token = [0u8; 32];
-        if let Some(t) = token {
-            let bytes = t.as_bytes();
-            let len = std::cmp::min(bytes.len(), 16);
-            self.token[..len].copy_from_slice(&bytes[..len]);
-        }
+        copy_name(&mut self.provider, provider);
+        copy_name(&mut self.token, token);
     }
 
-    /// Parse this header from wire format, converting fields from network byte
-    /// order to host byte order and validating the magic number.
+    /// Validate the magic number and convert an in-place wire-order header to
+    /// host byte order.
     ///
-    /// Returns `Ok(())` on success, or `Err(())` if the magic number does not match.
-    pub fn parse(&mut self) -> Result<(), ()> {
-        let magic = self.magic_num.to_be();
-        if magic != PROTOCOL_MAGIC {
-            return Err(());
+    /// A header produced by [`render`]/[`new`] is already in host order and
+    /// only needs validation. This method exists for callers that received raw
+    /// struct bytes from the C API.
+    pub fn parse(&mut self) -> YarResult<()> {
+        if self.magic_num == PROTOCOL_MAGIC {
+            return Ok(());
         }
-        self.magic_num = magic;
-        self.id = self.id.to_be();
-        self.body_len = self.body_len.to_be();
-        self.reserved = self.reserved.to_be();
-        Ok(())
+
+        // The fields came from wire bytes: convert them in place.
+        if u32::from_be(self.magic_num) == PROTOCOL_MAGIC {
+            self.id = u32::from_be(self.id);
+            self.version = u16::from_be(self.version);
+            self.magic_num = PROTOCOL_MAGIC;
+            self.reserved = u32::from_be(self.reserved);
+            self.body_len = u32::from_be(self.body_len);
+            return Ok(());
+        }
+
+        Err(YarError::InvalidMagic)
     }
 
-    /// Serialize the header to a byte buffer in network byte order (big-endian).
-    ///
-    /// The header fields are expected to be in host byte order.
-    /// This method produces wire-format bytes suitable for sending over the network.
+    /// Serialize the header to wire format (big-endian numeric fields).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let id = { self.id };
-        let version = { self.version };
-        let magic_num = { self.magic_num };
-        let reserved = { self.reserved };
-        let provider = self.provider;
-        let token = self.token;
-        let body_len = { self.body_len };
-
         let mut buf = vec![0u8; HEADER_SIZE];
-        let mut off = 0;
 
-        BigEndian::write_u32(&mut buf[off..off + 4], id);
-        off += 4;
-
-        BigEndian::write_u16(&mut buf[off..off + 2], version);
-        off += 2;
-
-        BigEndian::write_u32(&mut buf[off..off + 4], magic_num);
-        off += 4;
-
-        BigEndian::write_u32(&mut buf[off..off + 4], reserved);
-        off += 4;
-
-        buf[off..off + 32].copy_from_slice(&provider);
-        off += 32;
-
-        buf[off..off + 32].copy_from_slice(&token);
-        let _ = off + 32;
-
-        BigEndian::write_u32(&mut buf[78..82], body_len);
+        BigEndian::write_u32(&mut buf[0..4], self.id);
+        BigEndian::write_u16(&mut buf[4..6], self.version);
+        BigEndian::write_u32(&mut buf[6..10], self.magic_num);
+        BigEndian::write_u32(&mut buf[10..14], self.reserved);
+        buf[14..46].copy_from_slice(&self.provider);
+        buf[46..78].copy_from_slice(&self.token);
+        BigEndian::write_u32(&mut buf[78..82], self.body_len);
 
         buf
     }
 
-    /// Deserialize a header from a byte slice in network byte order.
-    /// Validates the magic number and returns `Err(())` if it does not match or
-    /// if the buffer is too short.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, ()> {
+    /// Deserialize a header from wire bytes, validating the magic number.
+    pub fn from_bytes(data: &[u8]) -> YarResult<Self> {
         if data.len() < HEADER_SIZE {
-            return Err(());
+            return Err(YarError::Protocol(format!(
+                "header too short: {} < {}",
+                data.len(),
+                HEADER_SIZE
+            )));
         }
 
-        let mut off = 0;
-
-        let id = BigEndian::read_u32(&data[off..off + 4]);
-        off += 4;
-
-        let version = BigEndian::read_u16(&data[off..off + 2]);
-        off += 2;
-
-        let magic_num = BigEndian::read_u32(&data[off..off + 4]);
-        off += 4;
-
-        let reserved = BigEndian::read_u32(&data[off..off + 4]);
-        off += 4;
+        let magic_num = BigEndian::read_u32(&data[6..10]);
+        if magic_num != PROTOCOL_MAGIC {
+            return Err(YarError::InvalidMagic);
+        }
 
         let mut provider = [0u8; 32];
-        provider.copy_from_slice(&data[off..off + 32]);
-        off += 32;
+        provider.copy_from_slice(&data[14..46]);
 
         let mut token = [0u8; 32];
-        token.copy_from_slice(&data[off..off + 32]);
-        off += 32;
-
-        let body_len = BigEndian::read_u32(&data[off..off + 4]);
-        let _ = off;
-
-        if magic_num != PROTOCOL_MAGIC {
-            return Err(());
-        }
+        token.copy_from_slice(&data[46..78]);
 
         Ok(YarHeader {
-            id,
-            version,
+            id: BigEndian::read_u32(&data[0..4]),
+            version: BigEndian::read_u16(&data[4..6]),
             magic_num,
-            reserved,
+            reserved: BigEndian::read_u32(&data[10..14]),
             provider,
             token,
-            body_len,
+            body_len: BigEndian::read_u32(&data[78..82]),
         })
+    }
+}
+
+/// Copy a provider/token name into its fixed-width field, leaving a NUL at the
+/// end like the C implementation.
+fn copy_name(dst: &mut [u8; 32], src: Option<&str>) {
+    dst.fill(0);
+    if let Some(name) = src {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(31);
+        dst[..len].copy_from_slice(&bytes[..len]);
     }
 }
 
@@ -204,38 +179,21 @@ impl Default for YarHeader {
 mod tests {
     use super::*;
 
-    /// Helper: safely read a u32 from a packed YarHeader field
-    macro_rules! packed_u32 {
-        ($h:expr, $field:ident) => {{
-            let h = &$h;
-            unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-        }};
-    }
-
-    /// Helper: safely read a u16 from a packed YarHeader field
-    macro_rules! packed_u16 {
-        ($h:expr, $field:ident) => {{
-            let h = &$h;
-            unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-        }};
-    }
-
     #[test]
     fn test_header_size() {
         // Fields: id(4)+version(2)+magic(4)+reserved(4)+provider(32)+token(32)+body_len(4) = 82
-        assert_eq!(mem::size_of::<YarHeader>(), HEADER_SIZE);
-        assert_eq!(mem::size_of::<YarHeader>(), 82);
+        assert_eq!(HEADER_SIZE, 82);
     }
 
     #[test]
-    fn test_render_network_byte_order() {
+    fn test_render_uses_host_order() {
         let mut header = YarHeader::new();
         header.render(0x12345678, None, None, 100, 42);
 
-        assert_eq!(u32::from_be(packed_u32!(header, id)), 0x12345678);
-        assert_eq!(u32::from_be(packed_u32!(header, magic_num)), PROTOCOL_MAGIC);
-        assert_eq!(u32::from_be(packed_u32!(header, body_len)), 100);
-        assert_eq!(u32::from_be(packed_u32!(header, reserved)), 42);
+        assert_eq!(header.id, 0x12345678);
+        assert_eq!(header.magic_num, PROTOCOL_MAGIC);
+        assert_eq!(header.body_len, 100);
+        assert_eq!(header.reserved, 42);
     }
 
     #[test]
@@ -244,8 +202,8 @@ mod tests {
         header.render(1, None, None, 0, 0);
 
         assert!(header.parse().is_ok());
-        assert_eq!(packed_u32!(header, id), 1);
-        assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
+        assert_eq!(header.id, 1);
+        assert_eq!(header.magic_num, PROTOCOL_MAGIC);
     }
 
     #[test]
@@ -265,26 +223,26 @@ mod tests {
         let mut parsed = header;
         assert!(parsed.parse().is_ok());
 
-        assert_eq!(packed_u32!(parsed, id), 99);
-        assert_eq!(packed_u16!(parsed, version), 1);
-        assert_eq!(packed_u32!(parsed, magic_num), PROTOCOL_MAGIC);
-        assert_eq!(packed_u32!(parsed, body_len), 256);
-        assert_eq!(packed_u32!(parsed, reserved), 7);
+        assert_eq!(parsed.id, 99);
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.magic_num, PROTOCOL_MAGIC);
+        assert_eq!(parsed.body_len, 256);
+        assert_eq!(parsed.reserved, 7);
         assert_eq!(&parsed.provider[..13], b"test-provider");
         assert_eq!(&parsed.token[..10], b"test-token");
     }
 
     #[test]
-    fn test_provider_token_only_16_bytes() {
+    fn test_provider_token_keep_31_bytes() {
         let mut header = YarHeader::new();
         let long_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         header.render(1, Some(long_str), Some(long_str), 0, 0);
 
-        // Only first 16 bytes should be copied, rest stays zeroed
-        assert_eq!(&header.provider[..16], b"ABCDEFGHIJKLMNOP");
-        assert_eq!(&header.provider[16..32], &[0u8; 16]);
-        assert_eq!(&header.token[..16], b"ABCDEFGHIJKLMNOP");
-        assert_eq!(&header.token[16..32], &[0u8; 16]);
+        // C copies up to 32 bytes and forces a NUL at byte 31.
+        assert_eq!(&header.provider[..31], &long_str.as_bytes()[..31]);
+        assert_eq!(header.provider[31], 0);
+        assert_eq!(&header.token[..31], &long_str.as_bytes()[..31]);
+        assert_eq!(header.token[31], 0);
     }
 
     #[test]
@@ -308,11 +266,11 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_SIZE);
 
         let parsed = YarHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(packed_u32!(parsed, id), 42);
-        assert_eq!(packed_u16!(parsed, version), 3);
-        assert_eq!(packed_u32!(parsed, magic_num), PROTOCOL_MAGIC);
-        assert_eq!(packed_u32!(parsed, body_len), 1024);
-        assert_eq!(packed_u32!(parsed, reserved), 0xFF);
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.magic_num, PROTOCOL_MAGIC);
+        assert_eq!(parsed.body_len, 1024);
+        assert_eq!(parsed.reserved, 0xFF);
         assert_eq!(&parsed.provider[..9], b"provider1");
         assert_eq!(&parsed.token[..6], b"token1");
     }
@@ -349,11 +307,8 @@ mod tests {
         let mut header = YarHeader::new();
         header.render(1, None, None, 64, 0);
 
-        // The rendered struct bytes should match network byte order directly.
-        // Since render() stores in network byte order, we read raw struct bytes.
-        let raw: [u8; HEADER_SIZE] = unsafe {
-            std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-        };
+        // to_bytes() produces the wire layout.
+        let raw = header.to_bytes();
 
         // Bytes 0..4: id = 1 in big-endian
         assert_eq!(BigEndian::read_u32(&raw[0..4]), 1);
@@ -392,10 +347,10 @@ mod tests {
         BigEndian::write_u32(&mut buf[off..off + 4], 512); // body_len
 
         let header = YarHeader::from_bytes(&buf).unwrap();
-        assert_eq!(packed_u32!(header, id), 42);
-        assert_eq!(packed_u16!(header, version), 2);
-        assert_eq!(packed_u32!(header, reserved), PROTOCOL_PERSISTENT);
-        assert_eq!(packed_u32!(header, body_len), 512);
+        assert_eq!(header.id, 42);
+        assert_eq!(header.version, 2);
+        assert_eq!(header.reserved, PROTOCOL_PERSISTENT);
+        assert_eq!(header.body_len, 512);
         assert_eq!(&header.provider[..5], b"hello");
         assert_eq!(&header.token[..5], b"world");
     }

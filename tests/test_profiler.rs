@@ -425,9 +425,7 @@ fn test_vu_reconnects_when_the_server_closes_the_connection() {
         let resp_len = (payload.len() - HEADER_SIZE) as u32;
         let mut header = YarHeader::new();
         header.render(id, None, None, resp_len, 0);
-        let header_bytes: [u8; HEADER_SIZE] = unsafe {
-            std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-        };
+        let header_bytes = header.to_bytes();
         payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
         payload[HEADER_SIZE..extra].copy_from_slice(PACKAGER_NAME);
         payload

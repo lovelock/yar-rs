@@ -123,39 +123,9 @@ async fn read_exact_idle(
     Ok(buf)
 }
 
-/// Parse a YarHeader from wire bytes (big-endian), correctly converting all
-/// fields to host byte order. Validates the magic number.
-///
-/// This works around `YarHeader::from_bytes` which stores `magic_num` and
-/// `body_len` in big-endian without converting to host byte order.
-fn parse_header_from_wire(data: &[u8]) -> Result<YarHeader, YarError> {
-    if data.len() < HEADER_SIZE {
-        return Err(YarError::Protocol("header too short".into()));
-    }
-
-    let magic_num = BigEndian::read_u32(&data[6..10]);
-    if magic_num != crate::protocol::PROTOCOL_MAGIC {
-        return Err(YarError::InvalidMagic);
-    }
-
-    let id = BigEndian::read_u32(&data[0..4]);
-    let version = BigEndian::read_u16(&data[4..6]);
-    let reserved = BigEndian::read_u32(&data[10..14]);
-    let mut provider = [0u8; 32];
-    provider.copy_from_slice(&data[14..46]);
-    let mut token = [0u8; 32];
-    token.copy_from_slice(&data[46..78]);
-    let body_len = BigEndian::read_u32(&data[78..82]);
-
-    Ok(YarHeader {
-        id,
-        version,
-        magic_num,
-        reserved,
-        provider,
-        token,
-        body_len,
-    })
+/// Parse a YarHeader from wire bytes, validating the magic number.
+fn parse_header_from_wire(data: &[u8]) -> YarResult<YarHeader> {
+    YarHeader::from_bytes(data)
 }
 
 // -- Connection handler -------------------------------------------------------
@@ -164,15 +134,10 @@ fn parse_header_from_wire(data: &[u8]) -> Result<YarHeader, YarError> {
 /// Bypasses render() + to_bytes() which has a double byte-swap issue on
 /// little-endian systems.
 fn build_response_header_bytes(id: u32, body_len: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; HEADER_SIZE];
-    BigEndian::write_u32(&mut buf[0..4], id);
-    BigEndian::write_u16(&mut buf[4..6], 0); // version
-    BigEndian::write_u32(&mut buf[6..10], crate::protocol::PROTOCOL_MAGIC);
-    BigEndian::write_u32(&mut buf[10..14], 0); // reserved
-    // provider[14..46] stays zeroed
-    // token[46..78] stays zeroed
-    BigEndian::write_u32(&mut buf[78..82], body_len);
-    buf
+    let mut header = YarHeader::new();
+    header.id = id;
+    header.body_len = body_len;
+    header.to_bytes()
 }
 
 /// Send a response back to the client.
@@ -492,12 +457,8 @@ where
         let body_bytes = match body_bytes {
             Some(b) => b,
             None => {
-                // YarHeader is packed: copy the fields we need via unaligned
-                // reads before referencing them (as in the packed_u32! helper).
-                let declared_len =
-                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(header.body_len)) };
-                let req_id =
-                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(header.id)) };
+                let declared_len = header.body_len;
+                let req_id = header.id;
 
                 logger::log_global(
                     logger::LogLevel::Warning,
@@ -594,14 +555,6 @@ mod tests {
     use byteorder::{BigEndian, ByteOrder};
     use crate::pack::Packager;
     use tokio::net::TcpStream;
-
-    /// Helper: safely read a u32 from a packed YarHeader field
-    macro_rules! packed_u32 {
-        ($h:expr, $field:ident) => {{
-            let h = &$h;
-            unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-        }};
-    }
 
     /// Build a complete Yar wire packet (header + packager_name + msgpack body).
     /// Constructs wire-format header bytes directly to avoid byte-order issues.
@@ -753,7 +706,7 @@ mod tests {
 
                 // Parse response
                 let (header, body) = parse_response_packet(response_data).unwrap();
-                assert_eq!(packed_u32!(header, id), 1);
+                assert_eq!(header.id, 1);
 
                 // Verify packager name
                 assert_eq!(&body[..PACKAGER_NAME.len()], PACKAGER_NAME.as_slice());

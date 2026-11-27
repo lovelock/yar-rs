@@ -78,12 +78,7 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
     //    still a truncated request even though zero body bytes arrived.
     let mut header = yar_rs::protocol::YarHeader::new();
     header.render(1, None, None, 1024, 0);
-    let header_bytes: [u8; yar_rs::protocol::HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(
-            &header as *const yar_rs::protocol::YarHeader
-                as *const [u8; yar_rs::protocol::HEADER_SIZE],
-        )
-    };
+    let header_bytes = header.to_bytes();
     let mut no_body = std::net::TcpStream::connect(&addr).unwrap();
     no_body.write_all(&header_bytes).unwrap();
     no_body.flush().unwrap();

@@ -273,10 +273,7 @@ impl YarClient {
         );
 
         // Copy header bytes into the payload prefix.
-        // The header is #[repr(C, packed)] so we read it as raw bytes.
-        let header_bytes: [u8; HEADER_SIZE] = unsafe {
-            std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-        };
+        let header_bytes = header.to_bytes();
         payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
 
         // Copy packager name after header
