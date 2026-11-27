@@ -23,9 +23,18 @@ use crate::PACKAGER_NAME;
 
 pub const SERVER_NAME: &str = "Yar Rust Server 0.1.0";
 
-/// Default maximum request body size accepted by the server (8 MiB, as
-/// `yar_server` does in the C implementation).
-pub const DEFAULT_MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
+/// Default maximum request body size accepted by the server (10 MiB, matching
+/// `YAR_MAX_BODY_SIZE` in the C implementation).
+pub const DEFAULT_MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+/// Default maximum number of concurrently served connections.
+pub const DEFAULT_MAX_INFLIGHT: usize = 1024;
+
+/// Default timeout for writing a response to a client.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default total deadline for receiving one request (header + body).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handler function type: takes request, returns response.
 pub type YarHandler = Box<dyn Fn(&YarRequest) -> YarResponse + Send + Sync>;
@@ -34,14 +43,23 @@ pub type YarHandler = Box<dyn Fn(&YarRequest) -> YarResponse + Send + Sync>;
 pub struct YarServer {
     hostname: String,
     handlers: Arc<RwLock<HashMap<String, YarHandler>>>,
-    max_workers: usize,
     max_request_size: usize,
     max_inflight: usize,
-    stand_alone: bool,
     read_timeout: Duration,
+    write_timeout: Duration,
+    request_timeout: Option<Duration>,
     log_file: Option<String>,
     log_level: logger::LogLevel,
     pid_file: Option<String>,
+}
+
+/// Per-connection limits copied into each connection task.
+#[derive(Clone, Copy)]
+struct ConnectionLimits {
+    max_request_size: usize,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    request_timeout: Option<Duration>,
 }
 
 // -- Private helpers ---------------------------------------------------------
@@ -139,9 +157,13 @@ fn build_response_header_bytes(id: u32, body_len: u32) -> Vec<u8> {
 }
 
 /// Send a response back to the client.
-async fn send_response<S>(stream: &mut S, response: &YarResponse, extra_bytes: usize) -> YarResult<()>
+async fn send_response<S>(
+    stream: &mut S,
+    response: &YarResponse,
+    extra_bytes: usize,
+) -> YarResult<()>
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: AsyncWriteExt + Unpin,
 {
     // Pack response with extra bytes for header + packager name
     let mut payload = response.pack(extra_bytes)?;
@@ -161,6 +183,23 @@ where
     Ok(())
 }
 
+/// Send a response with a write deadline, returning `Timeout` if the peer
+/// stops reading.
+async fn send_response_with_timeout<S>(
+    stream: &mut S,
+    response: &YarResponse,
+    extra_bytes: usize,
+    timeout: Duration,
+) -> YarResult<()>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    match tokio::time::timeout(timeout, send_response(stream, response, extra_bytes)).await {
+        Ok(result) => result,
+        Err(_) => Err(YarError::Timeout),
+    }
+}
+
 // -- YarServer implementation -------------------------------------------------
 
 impl YarServer {
@@ -170,16 +209,17 @@ impl YarServer {
     ///   - `"host:port"` for TCP
     ///   - `"/path/to/socket"` for Unix domain socket
     ///
-    /// Defaults: standalone=true, max_workers=1, read_timeout=3s.
+    /// Defaults: max_inflight=1024, read_timeout=3s, write_timeout=5s,
+    /// request_timeout=30s.
     pub fn new(hostname: &str) -> Self {
         YarServer {
             hostname: hostname.to_string(),
             handlers: Arc::new(RwLock::new(HashMap::new())),
-            max_workers: 1,
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
-            max_inflight: 0,
-            stand_alone: true,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
             read_timeout: Duration::from_secs(3),
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             log_file: None,
             log_level: logger::LogLevel::Notice,
             pid_file: None,
@@ -200,27 +240,11 @@ impl YarServer {
         map.insert(name.to_string(), handler);
     }
 
-    /// Sets whether the server runs in standalone (non-daemon) mode.
-    ///
-    /// In standalone mode the server does not daemonize or fork; it simply
-    /// runs the event loop in the current process. This is the default
-    /// and the safest setting for testing.
-    pub fn set_stand_alone(&mut self, stand_alone: bool) {
-        self.stand_alone = stand_alone;
-    }
-
-    /// Sets the number of worker tasks.
-    ///
-    /// The value is clamped to the range [1, 128].
-    pub fn set_max_workers(&mut self, n: usize) {
-        self.max_workers = n.clamp(1, 128);
-    }
-
     /// Sets the maximum request body size (in bytes) the server accepts.
     ///
-    /// A request whose header declares a larger body is rejected with an
-    /// error response before the body is read, protecting the server from
-    /// excessive memory allocation. Defaults to 8 MiB.
+    /// A request whose header declares a larger body is rejected before the
+    /// body is read, protecting the server from excessive memory allocation.
+    /// Defaults to 10 MiB, matching the C implementation.
     pub fn set_max_request_size(&mut self, bytes: usize) {
         self.max_request_size = bytes;
     }
@@ -229,14 +253,31 @@ impl YarServer {
     ///
     /// Beyond the limit, the accept loop blocks until a permit is released
     /// (a connection task returns) — connections wait rather than being
-    /// rejected. `0` (the default) disables the limit.
+    /// rejected. `0` disables the limit. Defaults to [`DEFAULT_MAX_INFLIGHT`].
     pub fn set_max_inflight(&mut self, n: usize) {
         self.max_inflight = n;
     }
 
-    /// Sets the per-request read timeout.
+    /// Sets the idle read timeout applied to each individual socket read.
     pub fn set_read_timeout(&mut self, timeout: Duration) {
         self.read_timeout = timeout;
+    }
+
+    /// Sets the timeout for writing one response.
+    ///
+    /// A client that stops reading can otherwise pin a connection task and
+    /// its response buffer forever.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        self.write_timeout = timeout;
+    }
+
+    /// Sets the total deadline for receiving one request (header + body).
+    ///
+    /// This complements the idle [`set_read_timeout`](Self::set_read_timeout):
+    /// a peer that trickles bytes slowly enough to keep each read alive is
+    /// still disconnected. `None` disables the total deadline.
+    pub fn set_request_timeout(&mut self, timeout: Option<Duration>) {
+        self.request_timeout = timeout;
     }
 
     /// Sets the log file path.
@@ -277,18 +318,30 @@ impl YarServer {
         }
 
         logger::set_hostname(&format!("yar-rs-server-{}", std::process::id()));
+
+        if let Some(path) = &self.pid_file {
+            std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
+                YarError::Protocol(format!("failed to write pid file {}: {}", path, e))
+            })?;
+        }
+
         logger::log_global(
             logger::LogLevel::Notice,
             &format!("Server starting on {} (standalone)", self.hostname),
         );
 
+        let limits = ConnectionLimits {
+            max_request_size: self.max_request_size,
+            read_timeout: self.read_timeout,
+            write_timeout: self.write_timeout,
+            request_timeout: self.request_timeout,
+        };
+        let max_inflight = self.max_inflight;
         let address = parse_address(&self.hostname)?;
 
         match address {
             Address::Tcp(addr) => {
-                let listener = TcpListener::bind(&addr).await.map_err(|e| {
-                    YarError::Io(e)
-                })?;
+                let listener = TcpListener::bind(&addr).await.map_err(YarError::Io)?;
 
                 // Log the actual bound address
                 if let Ok(local_addr) = listener.local_addr() {
@@ -299,19 +352,7 @@ impl YarServer {
                 }
 
                 let handlers = self.handlers.clone();
-                let read_timeout = self.read_timeout;
-                let max_request_size = self.max_request_size;
-                let max_inflight = self.max_inflight;
-
-                // Concurrency gate: at most `max_inflight` connections are
-                // served at once; 0 means unlimited. A permit is acquired in
-                // the accept loop (never rejected) and moved into the
-                // connection task, released when the task returns.
-                let semaphore = if max_inflight >= 1 {
-                    Some(Arc::new(Semaphore::new(max_inflight)))
-                } else {
-                    None
-                };
+                let semaphore = make_semaphore(max_inflight);
 
                 // Accept connections. Spawn a task per connection, gated by
                 // the max_inflight semaphore above (when set); tokio tasks
@@ -324,6 +365,8 @@ impl YarServer {
                                 logger::LogLevel::Warning,
                                 &format!("Accept error: {}", e),
                             );
+                            // Do not spin on persistent errors such as EMFILE.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         }
                     };
@@ -334,58 +377,107 @@ impl YarServer {
                     );
 
                     let handlers = handlers.clone();
-
-                    // Block here while saturated: a permit frees when an
-                    // older connection task finishes. (The semaphore is never
-                    // closed, so acquire cannot fail.)
-                    let permit = match &semaphore {
-                        Some(sem) => Some(
-                            sem.clone()
-                                .acquire_owned()
-                                .await
-                                .expect("inflight semaphore closed"),
-                        ),
-                        None => None,
-                    };
+                    let permit = acquire_permit(&semaphore).await;
 
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let _permit = permit; // released when this task returns
-                        // Apply read timeout per-request inside handle_connection
                         let _ = handle_connection_with_timeout(
                             &mut stream,
                             &handlers,
-                            read_timeout,
-                            max_request_size,
-                        ).await;
+                            limits,
+                        )
+                        .await;
                     });
                 }
             }
-            Address::Unix(_path) => {
-                // Unix socket support is planned but not yet implemented.
-                return Err(YarError::Protocol(
-                    "Unix domain sockets not yet implemented in Rust server".into(),
-                ));
+            Address::Unix(path) => {
+                #[cfg(unix)]
+                {
+                    let listener = tokio::net::UnixListener::bind(&path).map_err(YarError::Io)?;
+                    logger::log_global(
+                        logger::LogLevel::Notice,
+                        &format!("Listening on unix:{}", path),
+                    );
+
+                    let handlers = self.handlers.clone();
+                    let semaphore = make_semaphore(max_inflight);
+
+                    loop {
+                        let (stream, _) = match listener.accept().await {
+                            Ok((s, _)) => (s, ()),
+                            Err(e) => {
+                                logger::log_global(
+                                    logger::LogLevel::Warning,
+                                    &format!("Accept error: {}", e),
+                                );
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        };
+
+                        let handlers = handlers.clone();
+                        let permit = acquire_permit(&semaphore).await;
+
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let _permit = permit;
+                            let _ = handle_connection_with_timeout(
+                                &mut stream,
+                                &handlers,
+                                limits,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(YarError::Protocol(
+                        "Unix domain sockets are not supported on this platform".into(),
+                    ))
+                }
             }
         }
     }
 }
 
-/// Wrapper around handle_connection that applies a per-request timeout.
+fn make_semaphore(max_inflight: usize) -> Option<Arc<Semaphore>> {
+    if max_inflight >= 1 {
+        Some(Arc::new(Semaphore::new(max_inflight)))
+    } else {
+        None
+    }
+}
+
+async fn acquire_permit(semaphore: &Option<Arc<Semaphore>>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match semaphore {
+        Some(sem) => Some(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("inflight semaphore closed"),
+        ),
+        None => None,
+    }
+}
+
+/// Wrapper around handle_connection that applies per-request timeouts.
 async fn handle_connection_with_timeout<S>(
     stream: &mut S,
     handlers: &Arc<RwLock<HashMap<String, YarHandler>>>,
-    read_timeout: Duration,
-    max_request_size: usize,
+    limits: ConnectionLimits,
 ) -> YarResult<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    // One read cycle per request. The timeout is applied to each individual
-    // read (idle timeout), not to the whole header+body: under load a 4 MiB
-    // body legitimately takes longer than the timeout end to end.
+    let read_timeout = limits.read_timeout;
+    let max_request_size = limits.max_request_size;
+
+    // One read cycle per request.
     loop {
-        let result = async {
+        let read_future = async {
             // Read header
             let header_bytes = read_exact_idle(stream, HEADER_SIZE, read_timeout).await?;
 
@@ -420,8 +512,18 @@ where
             };
 
             Ok::<_, YarError>((header, is_persistent, Some(body_bytes)))
-        }
-        .await;
+        };
+
+        // The idle timeout bounds each individual read; the optional request
+        // deadline bounds the whole header+body exchange so a peer cannot
+        // trickle bytes forever.
+        let result = match limits.request_timeout {
+            Some(deadline) => match tokio::time::timeout(deadline, read_future).await {
+                Ok(result) => result,
+                Err(_) => Err(YarError::Timeout),
+            },
+            None => read_future.await,
+        };
 
         let (header, is_persistent, body_bytes) = match result {
             Ok(v) => v,
@@ -473,7 +575,13 @@ where
                         declared_len, max_request_size
                     ),
                 );
-                let _ = send_response(stream, &resp, extra_bytes).await;
+                let _ = send_response_with_timeout(
+                    stream,
+                    &resp,
+                    extra_bytes,
+                    limits.write_timeout,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -498,7 +606,13 @@ where
             Err(e) => {
                 logger::log_global(logger::LogLevel::Error, &format!("Unpack failed: {}", e));
                 let resp = YarResponse::error(header.id as u64, 1, &e.to_string());
-                let _ = send_response(stream, &resp, extra_bytes).await;
+                let _ = send_response_with_timeout(
+                    stream,
+                    &resp,
+                    extra_bytes,
+                    limits.write_timeout,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -508,7 +622,7 @@ where
 
         logger::log_global(
             logger::LogLevel::Debug,
-            &format!("Request: method={}, id={}", method, req_id),
+            &format!("Request: method={:?}, id={}", method, req_id),
         );
 
         // Handler lookup & invocation
@@ -519,15 +633,18 @@ where
                 None => {
                     logger::log_global(
                         logger::LogLevel::Warning,
-                        &format!("Method not found: {}", method),
+                        &format!("Method not found: {:?}", method),
                     );
                     YarResponse::error(req_id, 1, &YarError::MethodNotFound(method).to_string())
                 }
             }
         };
 
-        // Send response
-        if let Err(e) = send_response(stream, &response, extra_bytes).await {
+        // Send response, bounded so a client that stops reading cannot pin
+        // this task forever.
+        if let Err(e) =
+            send_response_with_timeout(stream, &response, extra_bytes, limits.write_timeout).await
+        {
             logger::log_global(logger::LogLevel::Error, &format!("Send failed: {}", e));
             return Ok(());
         }
@@ -599,13 +716,23 @@ mod tests {
         Ok((header, body))
     }
 
+    fn test_limits() -> ConnectionLimits {
+        ConnectionLimits {
+            max_request_size: DEFAULT_MAX_REQUEST_SIZE,
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            request_timeout: None,
+        }
+    }
+
     #[test]
     fn test_server_new() {
         let server = YarServer::new("127.0.0.1:9999");
         assert_eq!(server.hostname, "127.0.0.1:9999");
-        assert!(server.stand_alone);
-        assert_eq!(server.max_workers, 1);
+        assert_eq!(server.max_inflight, DEFAULT_MAX_INFLIGHT);
         assert_eq!(server.read_timeout, Duration::from_secs(3));
+        assert_eq!(server.write_timeout, DEFAULT_WRITE_TIMEOUT);
+        assert_eq!(server.request_timeout, Some(DEFAULT_REQUEST_TIMEOUT));
     }
 
     #[test]
@@ -737,12 +864,7 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(
-                &mut stream,
-                &handlers,
-                Duration::from_secs(5),
-                DEFAULT_MAX_REQUEST_SIZE,
-            ).await;
+            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
             let _ = stream.shutdown().await;
         });
 
@@ -796,12 +918,7 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(
-                &mut stream,
-                &handlers,
-                Duration::from_secs(5),
-                DEFAULT_MAX_REQUEST_SIZE,
-            ).await;
+            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
             let _ = stream.shutdown().await;
         });
 
@@ -855,12 +972,7 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(
-                &mut stream,
-                &handlers,
-                Duration::from_secs(5),
-                DEFAULT_MAX_REQUEST_SIZE,
-            ).await;
+            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
             let _ = stream.shutdown().await;
         });
 

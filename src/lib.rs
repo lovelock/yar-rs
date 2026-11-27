@@ -76,8 +76,11 @@ pub use protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, 
 pub use pack::{Packager, Unpackager, YarData, YarDataType};
 pub use request::YarRequest;
 pub use response::YarResponse;
-pub use client::YarClient;
-pub use server::YarServer;
+pub use client::{YarClient, DEFAULT_MAX_RESPONSE_SIZE};
+pub use server::{
+    YarServer, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_SIZE, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT,
+};
 pub use error::{YarError, YarResult};
 
 pub const VERSION: &str = "0.1.0";
