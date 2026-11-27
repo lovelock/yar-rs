@@ -144,36 +144,3 @@ fn total_request_deadline_closes_a_trickling_client() {
         started.elapsed()
     );
 }
-
-#[test]
-fn method_names_are_escaped_in_logs() {
-    let port = free_port();
-    let dir = std::env::temp_dir().join(format!("yar-rs-log-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let log_path = dir.join("server.log");
-    let _ = std::fs::remove_file(&log_path);
-    let log_arg = log_path.to_string_lossy().to_string();
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let mut server = YarServer::new(&format!("127.0.0.1:{port}"));
-            server.set_log_file(&log_arg);
-            server.run().await.unwrap();
-        });
-    });
-    wait_for_port(port);
-
-    // Unknown method containing a newline: must not forge a log line.
-    let mut client = YarClient::connect(&format!("127.0.0.1:{port}")).unwrap();
-    client.set_timeout(Duration::from_secs(2));
-    let _ = client.call("evil\nINJECTED", vec![]);
-
-    std::thread::sleep(Duration::from_millis(100));
-    let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-    assert!(
-        !contents.contains("\nINJECTED"),
-        "method name was not escaped: {contents:?}"
-    );
-    let _ = std::fs::remove_file(&log_path);
-}

@@ -13,7 +13,7 @@
 | `Pack(String)` | `Pack error:` | msgpack 打包/解析失败 |
 | `Io(std::io::Error)` | `IO error:` | 网络读写 IO 失败 |
 | `Connection(String)` | `Connection error:` | 连接失败；`call` 期间对端关闭（如"connection closed: expected 82 bytes, got 0" —— 非持久 client 调第二次 call 的典型症状）；`http://` 地址等 |
-| `Timeout` | `Timeout` | （保留变体） |
+| `Timeout` | `Timeout` | 连接/读写/请求超时 |
 | `InvalidMagic` | `Invalid magic number` | 对端发来的不是 Yar 协议（魔数校验失败） |
 | `UnsupportedPackager(String)` | `Unsupported packager:` | 对端使用了非 `MSGPACK\0` 的打包器名 |
 | `MethodNotFound(String)` | `Method not found:` | **服务端**未注册该方法（自动回包给客户端，客户端在 `status`/`error` 里看到此消息） |

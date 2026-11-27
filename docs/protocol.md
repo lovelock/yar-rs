@@ -46,20 +46,19 @@ use yar_rs::{YarHeader, PROTOCOL_PERSISTENT, HEADER_SIZE};
 
 let mut header = YarHeader::new();
 // 参数：id, provider(最多 31 字节), token(最多 31 字节), body_len, reserved(标志位)
+// render() 写入的是主机字节序字段，不需要再调用 parse()。
 header.render(1000, Some("Yar(Rust)-0.1.0"), None, 128, PROTOCOL_PERSISTENT);
-// render() 之后的字段是网络字节序，parse() 校验魔数并转回主机序，供 to_bytes() 序列化
-header.parse().unwrap();
 
-// 线上字节（大端）：可以直接 send 给 server / client
+// to_bytes() 生成线上大端字节，可以直接 send 给 server / client
 let wire = header.to_bytes();
-assert_eq!(wire.len(), std::mem::size_of::<yar_rs::YarHeader>()); // 82
+assert_eq!(wire.len(), HEADER_SIZE); // 82
 
 // 对端解析（校验魔数 0x80DFEC60，不匹配返回 Err）
 let parsed = YarHeader::from_bytes(&wire).unwrap();
+assert_eq!(parsed.id, 1000);
+assert_eq!(parsed.body_len, 128);
 let wire_id = u32::from_be_bytes(wire[0..4].try_into().unwrap());
-let wire_body_len = u32::from_be_bytes(wire[78..82].try_into().unwrap());
 assert_eq!(wire_id, 1000);
-assert_eq!(wire_body_len, 128);
 ```
 
 ## msgpack 请求体

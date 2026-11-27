@@ -93,3 +93,48 @@ fn mismatched_response_id_is_rejected() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn a_failed_call_poisons_the_connection() {
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        // Answer the first request after the client's read timeout expires.
+        thread::sleep(Duration::from_millis(300));
+        let body = response_body(1000, PACKAGER_NAME);
+        let mut header = vec![0u8; HEADER_SIZE];
+        BigEndian::write_u32(&mut header[0..4], 1000);
+        BigEndian::write_u32(&mut header[6..10], PROTOCOL_MAGIC);
+        BigEndian::write_u32(&mut header[78..82], body.len() as u32);
+        let _ = stream.write_all(&header);
+        let _ = stream.write_all(&body);
+        let _ = stream.flush();
+    });
+
+    let mut client = YarClient::connect(&addr).unwrap();
+    client.set_timeout(Duration::from_millis(100));
+
+    let first = client.call("echo", vec![]).err().expect("must time out");
+    assert!(
+        matches!(first, yar_rs::YarError::Timeout),
+        "expected Timeout, got: {first}"
+    );
+
+    // The socket still holds the late response. A second call must not be
+    // allowed to read it as its own result, even with a generous timeout.
+    client.set_timeout(Duration::from_secs(2));
+    let second = client.call("echo", vec![]).err().expect("must reject");
+    assert!(
+        second.to_string().contains("unusable") || second.to_string().contains("failed call"),
+        "expected a poisoned-connection error, got: {second}"
+    );
+
+    server.join().unwrap();
+}

@@ -23,8 +23,8 @@ pub const CLIENT_NAME: &str = concat!("Yar(Rust)-", env!("CARGO_PKG_VERSION"));
 /// Default request ID (matching C client's dummy id).
 const DEFAULT_REQUEST_ID: u64 = 1000;
 
-/// Default timeout in seconds (matching C client's default).
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
+/// Default read/write timeout in seconds (matching C client's 1 s default).
+const DEFAULT_TIMEOUT_SECS: u64 = 1;
 
 /// Default maximum response body size accepted by the client (10 MiB,
 /// matching `YAR_MAX_BODY_SIZE` in the C implementation).
@@ -90,6 +90,9 @@ pub struct YarClient {
     persistent: bool,
     timeout: Duration,
     max_response_size: usize,
+    /// Set after a failed call: the stream may still contain a late response,
+    /// so it can no longer be trusted for another request.
+    failed: bool,
 }
 
 impl std::fmt::Debug for YarClient {
@@ -99,6 +102,7 @@ impl std::fmt::Debug for YarClient {
             .field("persistent", &self.persistent)
             .field("timeout", &self.timeout)
             .field("max_response_size", &self.max_response_size)
+            .field("failed", &self.failed)
             .finish()
     }
 }
@@ -204,6 +208,7 @@ impl YarClient {
             persistent: false,
             timeout,
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+            failed: false,
         })
     }
 
@@ -238,6 +243,23 @@ impl YarClient {
     /// Wire format received:
     ///   [82-byte header][8-byte packager name][msgpack response body]
     pub fn call(&mut self, method: &str, params: Vec<Packager>) -> YarResult<YarResponse> {
+        if self.failed {
+            return Err(YarError::Connection(
+                "client connection is unusable after a failed call; reconnect with YarClient::connect"
+                    .into(),
+            ));
+        }
+
+        let result = self.call_inner(method, params);
+        if result.is_err() {
+            // A read timeout or protocol error can leave a late response in the
+            // stream. Reusing the socket would let the next call consume it.
+            self.failed = true;
+        }
+        result
+    }
+
+    fn call_inner(&mut self, method: &str, params: Vec<Packager>) -> YarResult<YarResponse> {
         // Build the request
         let mut request = YarRequest::new(DEFAULT_REQUEST_ID, method);
         if !params.is_empty() {
@@ -282,7 +304,7 @@ impl YarClient {
         logger::log_global(
             logger::LogLevel::Debug,
             &format!(
-                "sent request: method={}, body_len={}, total={}",
+                "sent request: method={:?}, body_len={}, total={}",
                 method,
                 body_len,
                 payload.len()

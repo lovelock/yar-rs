@@ -260,7 +260,7 @@ mod tests {
         header.version = 3;
         header.render(42, Some("provider1"), Some("token1"), 1024, 0xFF);
 
-        // Convert to host byte order first (render puts in network order)
+        // render() already stores host-order fields; parse() just validates.
         header.parse().unwrap();
 
         let bytes = header.to_bytes();

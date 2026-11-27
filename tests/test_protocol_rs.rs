@@ -52,7 +52,7 @@ fn test_render_produces_c_compatible_bytes() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 64, 0);
 
-    // Read the raw struct bytes (render stores in network byte order)
+    // Serialize to wire bytes (big-endian)
     let raw = header.to_bytes();
 
     // Bytes 0..4: id = 1 in big-endian
@@ -192,7 +192,7 @@ fn test_to_bytes_from_bytes_roundtrip() {
     header.version = 3;
     header.render(42, Some("provider1"), Some("token1"), 1024, 0xFF);
 
-    // Convert to host byte order first (render puts in network order)
+    // render() stores host-order fields; parse() just validates.
     header.parse().unwrap();
 
     let bytes = header.to_bytes();

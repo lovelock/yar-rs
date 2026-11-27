@@ -420,3 +420,35 @@ fn test_integration_non_persistent_multiple_connections() {
         assert_eq!(resp.get_status(), 0);
     }
 }
+
+#[test]
+fn test_server_echoes_the_request_id() {
+    let port = find_available_port();
+    let addr = format!("127.0.0.1:{}", port);
+
+    let _server_thread = start_server(port, |server| {
+        Box::pin(async move {
+            // Deliberately return id 0: the server must overwrite it with the
+            // request id, exactly as the C server does.
+            server
+                .register_handler("legacy", |_req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"ok").unwrap();
+                    YarResponse::success(0, pk)
+                })
+                .await;
+        })
+    });
+
+    wait_for_port(port);
+
+    let mut client = YarClient::connect(&addr).unwrap();
+    client.set_timeout(Duration::from_secs(5));
+
+    let resp = client.call("legacy", vec![]).unwrap();
+    assert_eq!(resp.get_status(), 0);
+    assert_eq!(resp.id, 1000);
+    assert_eq!(resp.get_response().unwrap().as_str(), Some("ok"));
+
+    client.close();
+}

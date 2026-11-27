@@ -81,7 +81,7 @@ fn string_length_beyond_input_is_rejected_before_allocation() {
 
 #[test]
 fn excessive_node_count_is_rejected() {
-    let items = 1_000_001u32;
+    let items = 262_145u32;
     let mut bytes = Vec::with_capacity(5 + items as usize);
     bytes.push(0xdd); // array32
     bytes.extend_from_slice(&items.to_be_bytes());

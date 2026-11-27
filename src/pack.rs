@@ -315,7 +315,7 @@ pub const MAX_PARSE_DEPTH: usize = 128;
 ///
 /// `YarData` is roughly 32 bytes per node, so an 8 MiB body made of `nil`
 /// markers would otherwise expand to hundreds of megabytes of memory.
-pub const MAX_PARSE_NODES: usize = 1_000_000;
+pub const MAX_PARSE_NODES: usize = 262_144;
 
 /// Parses msgpack bytes into a YarData tree.
 pub struct Unpackager {

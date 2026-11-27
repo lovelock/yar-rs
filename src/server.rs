@@ -146,13 +146,11 @@ fn parse_header_from_wire(data: &[u8]) -> YarResult<YarHeader> {
 
 // -- Connection handler -------------------------------------------------------
 
-/// Build a response header directly in wire format (big-endian).
-/// Bypasses render() + to_bytes() which has a double byte-swap issue on
-/// little-endian systems.
+/// Build a response header in wire format (big-endian), with the server name
+/// in the provider field like the C implementation.
 fn build_response_header_bytes(id: u32, body_len: u32) -> Vec<u8> {
     let mut header = YarHeader::new();
-    header.id = id;
-    header.body_len = body_len;
+    header.render(id, Some(SERVER_NAME), None, body_len, 0);
     header.to_bytes()
 }
 
@@ -168,8 +166,7 @@ where
     // Pack response with extra bytes for header + packager name
     let mut payload = response.pack(extra_bytes)?;
 
-    // Build header directly in wire format (big-endian), bypassing render+to_bytes
-    // which has a double byte-swap issue on little-endian systems.
+    // Build the header in wire format (big-endian).
     let body_len = (payload.len() - HEADER_SIZE) as u32;
     let header_bytes = build_response_header_bytes(response.id as u32, body_len);
     payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
@@ -256,7 +253,8 @@ impl YarServer {
     /// (a connection task returns) — connections wait rather than being
     /// rejected. `0` disables the limit. Defaults to [`DEFAULT_MAX_INFLIGHT`].
     pub fn set_max_inflight(&mut self, n: usize) {
-        self.max_inflight = n;
+        // Semaphore::new panics above its MAX_PERMITS.
+        self.max_inflight = n.min(1_000_000);
     }
 
     /// Sets the idle read timeout applied to each individual socket read.
@@ -286,7 +284,7 @@ impl YarServer {
         self.log_file = Some(path.to_string());
     }
 
-    /// Sets the PID file path (currently informational only in the Rust impl).
+    /// Sets the PID file path; the PID is written after the listener binds.
     pub fn set_pid_file(&mut self, path: &str) {
         self.pid_file = Some(path.to_string());
     }
@@ -320,12 +318,6 @@ impl YarServer {
 
         logger::set_hostname(&format!("yar-rs-server-{}", std::process::id()));
 
-        if let Some(path) = &self.pid_file {
-            std::fs::write(path, format!("{}\n", std::process::id())).map_err(|e| {
-                YarError::Protocol(format!("failed to write pid file {}: {}", path, e))
-            })?;
-        }
-
         logger::log_global(
             logger::LogLevel::Notice,
             &format!("Server starting on {} (standalone)", self.hostname),
@@ -343,6 +335,7 @@ impl YarServer {
         match address {
             Address::Tcp(addr) => {
                 let listener = TcpListener::bind(&addr).await.map_err(YarError::Io)?;
+                write_pid_file(&self.pid_file)?;
 
                 // Log the actual bound address
                 if let Ok(local_addr) = listener.local_addr() {
@@ -392,6 +385,7 @@ impl YarServer {
                 #[cfg(unix)]
                 {
                     let listener = tokio::net::UnixListener::bind(&path).map_err(YarError::Io)?;
+                    write_pid_file(&self.pid_file)?;
                     logger::log_global(
                         logger::LogLevel::Notice,
                         &format!("Listening on unix:{}", path),
@@ -434,6 +428,14 @@ impl YarServer {
             }
         }
     }
+}
+
+fn write_pid_file(path: &Option<String>) -> YarResult<()> {
+    if let Some(path) = path {
+        std::fs::write(path, format!("{}\n", std::process::id()))
+            .map_err(|e| YarError::Protocol(format!("failed to write pid file {}: {}", path, e)))?;
+    }
+    Ok(())
 }
 
 fn make_semaphore(max_inflight: usize) -> Option<Arc<Semaphore>> {
@@ -612,7 +614,7 @@ where
         );
 
         // Handler lookup & invocation
-        let response = {
+        let mut response = {
             let guard = handlers.read().await;
             match guard.get(&method) {
                 Some(h) => h(&request),
@@ -625,6 +627,10 @@ where
                 }
             }
         };
+
+        // Protocol-level: the response id always echoes the request id, as the
+        // C server does. Handlers may leave it at 0.
+        response.id = req_id;
 
         // Send response, bounded so a client that stops reading cannot pin
         // this task forever.

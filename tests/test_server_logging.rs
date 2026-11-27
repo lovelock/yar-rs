@@ -112,4 +112,24 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
         notices.len(),
         text
     );
+
+    // 4) a method name with a newline must be escaped, not forge a log line.
+    let mut client = YarClient::connect(&addr).unwrap();
+    client.set_timeout(Duration::from_secs(2));
+    let _ = client.call("evil\nINJECTED", vec![]);
+    assert!(
+        wait_until(Duration::from_secs(5), || read_log(&log_path)
+            .contains("Method not found")),
+        "expected a method-not-found line:\n{}",
+        read_log(&log_path)
+    );
+    let text = read_log(&log_path);
+    assert!(
+        !text.contains("\nINJECTED"),
+        "method name was not escaped:\n{text}"
+    );
+    assert!(
+        text.contains("evil\\nINJECTED"),
+        "expected the escaped method name in the log:\n{text}"
+    );
 }

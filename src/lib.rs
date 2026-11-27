@@ -8,7 +8,7 @@
 //! # 三个典型入口
 //!
 //! - 服务端：[`YarServer::new`] + [`YarServer::register_handler`] + [`YarServer::run`]（Tokio 异步）
-//! - 客户端：[`YarClient::connect`] + [`YarClient::call`]（同步阻塞，持久连接）
+//! - 客户端：[`YarClient::connect`] + [`YarClient::call`]（同步阻塞，可选持久连接）
 //! - 打包：[`Packager`]（增量打包） / [`Unpackager`]（解析为 [`YarData`] 树）
 //!
 //! # 打包/解析往返示例

@@ -120,7 +120,8 @@ resp.get_response() -> Option<&YarData>  # 返回值 r 字段；出错时为 Non
 resp.get_error()    -> Option<&str>  # 错误信息 e 字段；成功时为 None（含客户端未注册方法等）
 ```
 
-客户端收到的响应解析必然成功或抛出传输类错误（连接断开/超时/非法魔数）；
+客户端会校验响应大小、packager 名与响应 id；失败时返回传输/协议类 `Err`
+（连接断开、超时、非法魔数、响应过大、id 不匹配等）。
 **业务失败永远体现在 `status`/`error` 上，而不是 `Err`**。
 
 ## 错误处理
