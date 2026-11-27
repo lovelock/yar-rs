@@ -21,7 +21,7 @@ use crate::response::YarResponse;
 use crate::logger;
 use crate::PACKAGER_NAME;
 
-pub const SERVER_NAME: &str = "Yar Rust Server 0.1.0";
+pub const SERVER_NAME: &str = concat!("Yar Rust Server ", env!("CARGO_PKG_VERSION"));
 
 /// Default maximum request body size accepted by the server (10 MiB, matching
 /// `YAR_MAX_BODY_SIZE` in the C implementation).

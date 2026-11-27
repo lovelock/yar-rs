@@ -70,6 +70,9 @@ pub mod logger;
 pub mod client;
 pub mod server;
 pub mod error;
+#[doc(hidden)]
+pub mod cli;
+#[cfg(feature = "profiler")]
 pub mod profiler;
 
 pub use protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING, PROTOCOL_LIST};
@@ -83,6 +86,9 @@ pub use server::{
 };
 pub use error::{YarError, YarResult};
 
-pub const VERSION: &str = "0.1.0";
+/// Crate version, taken from `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Packager name embedded in every Yar packet.
 pub const PACKAGER_NAME: &[u8; 8] = b"MSGPACK\0";
+/// Packager name without the trailing NUL.
 pub const PACKAGER_NAME_STR: &str = "MSGPACK";

@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use yar_rs::pack::Packager;
-use yar_rs::profiler::{parse_duration_suffix, parse_size_suffix};
+use yar_rs::cli::{parse_duration_suffix, parse_size_suffix};
 use yar_rs::response::YarResponse;
 use yar_rs::server::YarServer;
 

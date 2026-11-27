@@ -1,3 +1,5 @@
+#![cfg(feature = "profiler")]
+
 //! Tests for the profiler library: percentile primitives, CSV rendering,
 //! validation of `run_profile` configs, and an end-to-end load run against
 //! the real `yar-server-rust` binary.

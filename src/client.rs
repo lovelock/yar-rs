@@ -18,7 +18,7 @@ use crate::response::YarResponse;
 use crate::{PACKAGER_NAME, PACKAGER_NAME_STR};
 
 /// Client name sent in the header provider field.
-pub const CLIENT_NAME: &str = "Yar(Rust)-0.1.0";
+pub const CLIENT_NAME: &str = concat!("Yar(Rust)-", env!("CARGO_PKG_VERSION"));
 
 /// Default request ID (matching C client's dummy id).
 const DEFAULT_REQUEST_ID: u64 = 1000;
