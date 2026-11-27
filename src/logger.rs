@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -39,6 +40,7 @@ impl LogLevel {
 enum LoggerOutput {
     Stderr,
     File(File),
+    #[cfg_attr(not(unix), allow(dead_code))] // pipe targets are Unix-only
     Pipe(std::process::ChildStdin),
 }
 
@@ -82,16 +84,30 @@ impl YarLogger {
         let (output, child) = match path {
             None => (LoggerOutput::Stderr, None),
             Some(p) if p.starts_with('|') => {
-                let cmd = p.trim_start_matches('|').trim();
-                let mut c = Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .stdin(Stdio::piped())
-                    .spawn()?;
-                let stdin = c.stdin.take().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "failed to open pipe stdin")
-                })?;
-                (LoggerOutput::Pipe(stdin), Some(c))
+                #[cfg(unix)]
+                {
+                    let cmd = p.trim_start_matches('|').trim();
+                    let mut c = Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .stdin(Stdio::piped())
+                        .spawn()?;
+                    let stdin = c.stdin.take().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "failed to open pipe stdin",
+                        )
+                    })?;
+                    (LoggerOutput::Pipe(stdin), Some(c))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = p;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "pipe logging is only supported on Unix",
+                    ));
+                }
             }
             Some(p) => {
                 let f = OpenOptions::new().create(true).append(true).open(p)?;
