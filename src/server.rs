@@ -14,8 +14,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 
-use byteorder::{BigEndian, ByteOrder};
-
 use crate::error::{YarError, YarResult};
 use crate::protocol::{YarHeader, HEADER_SIZE, PROTOCOL_PERSISTENT};
 use crate::request::YarRequest;

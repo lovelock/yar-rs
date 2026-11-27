@@ -87,11 +87,14 @@ impl YarData {
         }
     }
 
-    /// Returns the numeric value as i64, converting from Ulong if needed.
+    /// Returns the numeric value as i64, converting from Ulong when it fits.
+    ///
+    /// Values above `i64::MAX` do not fit and yield `None` instead of wrapping
+    /// to a negative number.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             YarData::Long(v) => Some(*v),
-            YarData::Ulong(v) => Some(*v as i64),
+            YarData::Ulong(v) => i64::try_from(*v).ok(),
             _ => None,
         }
     }

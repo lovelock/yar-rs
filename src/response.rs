@@ -83,10 +83,12 @@ impl YarResponse {
         pk.push_string(b"s")?;
         pk.push_long(self.status)?;
 
-        // "r" -> retval or null
+        // "r" -> retval, retval data, or null
         pk.push_string(b"r")?;
         if let Some(ref packed) = self.retval_packed {
             pk.push_packager(packed)?;
+        } else if let Some(ref data) = self.retval {
+            pk.push_data(data)?;
         } else {
             pk.push_null()?;
         }
@@ -118,23 +120,24 @@ impl YarResponse {
             YarError::Protocol("response root is not a map".into())
         })?;
 
-        let mut id: u64 = 0;
-        let mut status: i64 = 0;
+        let mut id: Option<u64> = None;
+        let mut status: Option<i64> = None;
         let mut error: Option<String> = None;
         let mut retval: Option<YarData> = None;
 
         for (key, val) in map {
             match key.as_bytes() {
                 Some(b"i") => {
-                    id = val.as_ulong().ok_or_else(|| {
+                    id = Some(val.as_ulong().ok_or_else(|| {
                         YarError::Protocol("response 'i' is not ulong".into())
-                    })?;
+                    })?);
                 }
                 Some(b"s") => {
-                    // C code checks for YAR_DATA_ULONG but we handle both Long and Ulong
-                    status = val.as_integer().ok_or_else(|| {
-                        YarError::Protocol("response 's' is not an integer".into())
-                    })?;
+                    // C code checks for YAR_DATA_ULONG but we handle both Long and Ulong.
+                    // Ulong values above i64::MAX are rejected rather than wrapped.
+                    status = Some(val.as_integer().ok_or_else(|| {
+                        YarError::Protocol("response 's' is not an in-range integer".into())
+                    })?);
                 }
                 Some(b"r") => {
                     if val.data_type() != crate::pack::YarDataType::Null {
@@ -152,6 +155,10 @@ impl YarResponse {
                 _ => {} // ignore unknown keys
             }
         }
+
+        let id = id.ok_or_else(|| YarError::Protocol("response missing 'i' field".into()))?;
+        let status =
+            status.ok_or_else(|| YarError::Protocol("response missing 's' field".into()))?;
 
         Ok(YarResponse {
             id,

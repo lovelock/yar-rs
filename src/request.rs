@@ -60,10 +60,12 @@ impl YarRequest {
         pk.push_string(b"m")?;
         pk.push_string(self.method.as_bytes())?;
 
-        // Key "p" -> parameters (embedded packager bytes or null)
+        // Key "p" -> parameters (packed bytes, an unpacked value, or null)
         pk.push_string(b"p")?;
         if let Some(ref inner) = self.params_packed {
             pk.push_packager(inner)?;
+        } else if let Some(ref data) = self.params {
+            pk.push_data(data)?;
         } else {
             pk.push_null()?;
         }
