@@ -120,10 +120,7 @@ impl YarClient {
     ///
     /// The connect timeout bounds DNS-resolved TCP connection attempts. Unix
     /// domain socket connects are immediate and not affected.
-    pub fn connect_with_timeout(
-        hostname: &str,
-        connect_timeout: Duration,
-    ) -> YarResult<Self> {
+    pub fn connect_with_timeout(hostname: &str, connect_timeout: Duration) -> YarResult<Self> {
         if hostname.starts_with("http://") || hostname.starts_with("https://") {
             return Err(YarError::Connection(
                 "HTTP/HTTPS not supported; use host:port or /path for Unix socket".into(),
@@ -327,10 +324,7 @@ impl YarClient {
         let resp_id = resp_header.id;
         logger::log_global(
             logger::LogLevel::Debug,
-            &format!(
-                "recv response: id={}, body_len={}",
-                resp_id, resp_body_len
-            ),
+            &format!("recv response: id={}, body_len={}", resp_id, resp_body_len),
         );
 
         // Verify the packager before parsing its payload.
@@ -472,9 +466,13 @@ mod tests {
 
     #[test]
     fn test_client_name() {
-        assert_eq!(CLIENT_NAME, "Yar(Rust)-0.1.0");
+        assert_eq!(
+            CLIENT_NAME,
+            concat!("Yar(Rust)-", env!("CARGO_PKG_VERSION"))
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_client_unix_socket_missing() {
         let result = YarClient::connect("/tmp/nonexistent_yar_test.sock");

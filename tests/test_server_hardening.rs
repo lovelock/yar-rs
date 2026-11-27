@@ -112,7 +112,9 @@ fn total_request_deadline_closes_a_trickling_client() {
     wait_for_port(port);
 
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
 
     // Announce a body larger than the single byte we send, then trickle.
     let mut header = YarHeader::new();
@@ -125,9 +127,8 @@ fn total_request_deadline_closes_a_trickling_client() {
         if started.elapsed() > Duration::from_secs(3) {
             panic!("server did not enforce the total request deadline");
         }
-        match stream.write_all(&[0x00]) {
-            Err(_) => break,
-            Ok(()) => {}
+        if stream.write_all(&[0x00]).is_err() {
+            break;
         }
         match stream.read(&mut buf) {
             Ok(0) => break,

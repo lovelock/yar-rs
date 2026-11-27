@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 //! Yar RPC framework - Rust implementation
 //!
 //! 与原 Yar C 实现线上协议完全兼容的 RPC 框架。
@@ -62,29 +64,31 @@
 //! assert_eq!(resp.get_status(), 0);
 //! ```
 
-pub mod protocol;
-pub mod pack;
-pub mod request;
-pub mod response;
-pub mod logger;
-pub mod client;
-pub mod server;
-pub mod error;
 #[doc(hidden)]
 pub mod cli;
+pub mod client;
+pub mod error;
+pub mod logger;
+pub mod pack;
 #[cfg(feature = "profiler")]
 pub mod profiler;
+pub mod protocol;
+pub mod request;
+pub mod response;
+pub mod server;
 
-pub use protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING, PROTOCOL_LIST};
+pub use client::{YarClient, DEFAULT_MAX_RESPONSE_SIZE};
+pub use error::{YarError, YarResult};
 pub use pack::{Packager, Unpackager, YarData, YarDataType};
+pub use protocol::{
+    YarHeader, HEADER_SIZE, PROTOCOL_LIST, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING,
+};
 pub use request::YarRequest;
 pub use response::YarResponse;
-pub use client::{YarClient, DEFAULT_MAX_RESPONSE_SIZE};
 pub use server::{
     YarServer, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_SIZE, DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_WRITE_TIMEOUT,
 };
-pub use error::{YarError, YarResult};
 
 /// Crate version, taken from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

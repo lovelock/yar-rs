@@ -38,7 +38,7 @@ assert!(matches!(err2, YarError::Connection(_)));
 
 **业务错误不产生 `Err`，只体现在响应状态里**：
 
-```rust
+```text
 // 服务端 handler：
 let mut resp = YarResponse::new(req.id());
 resp.set_error(10000, "division by zero");

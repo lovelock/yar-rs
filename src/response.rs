@@ -55,11 +55,10 @@ impl YarResponse {
         let bytes = message.as_bytes();
         if bytes.len() > 1024 {
             // Truncate at 1024 bytes, being careful with UTF-8 boundaries
-            let truncated = std::str::from_utf8(&bytes[..1024])
-                .unwrap_or_else(|e| {
-                    // If we land mid-char, back up to valid boundary
-                    std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or("")
-                });
+            let truncated = std::str::from_utf8(&bytes[..1024]).unwrap_or_else(|e| {
+                // If we land mid-char, back up to valid boundary
+                std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or("")
+            });
             self.error = Some(format!("{}...", truncated));
         } else {
             self.error = Some(message.to_string());
@@ -116,9 +115,9 @@ impl YarResponse {
         let unpk = Unpackager::new(payload)?;
         let root = unpk.data();
 
-        let map = root.as_map().ok_or_else(|| {
-            YarError::Protocol("response root is not a map".into())
-        })?;
+        let map = root
+            .as_map()
+            .ok_or_else(|| YarError::Protocol("response root is not a map".into()))?;
 
         let mut id: Option<u64> = None;
         let mut status: Option<i64> = None;
@@ -128,9 +127,10 @@ impl YarResponse {
         for (key, val) in map {
             match key.as_bytes() {
                 Some(b"i") => {
-                    id = Some(val.as_ulong().ok_or_else(|| {
-                        YarError::Protocol("response 'i' is not ulong".into())
-                    })?);
+                    id =
+                        Some(val.as_ulong().ok_or_else(|| {
+                            YarError::Protocol("response 'i' is not ulong".into())
+                        })?);
                 }
                 Some(b"s") => {
                     // C code checks for YAR_DATA_ULONG but we handle both Long and Ulong.
@@ -144,13 +144,11 @@ impl YarResponse {
                         retval = Some(val.clone());
                     }
                 }
-                Some(b"e") => {
-                    if val.data_type() != crate::pack::YarDataType::Null {
-                        let err_str = val.as_str().ok_or_else(|| {
-                            YarError::Protocol("response 'e' is not a string".into())
-                        })?;
-                        error = Some(err_str.to_string());
-                    }
+                Some(b"e") if val.data_type() != crate::pack::YarDataType::Null => {
+                    let err_str = val
+                        .as_str()
+                        .ok_or_else(|| YarError::Protocol("response 'e' is not a string".into()))?;
+                    error = Some(err_str.to_string());
                 }
                 _ => {} // ignore unknown keys
             }
@@ -291,11 +289,11 @@ mod tests {
         // "r" = fixstr(1) 0xa1 + 'r', value = nil 0xc0
         // "e" = fixstr(1) 0xa1 + 'e', value = nil 0xc0
         let expected: Vec<u8> = vec![
-            0x84,                   // fixmap(4)
-            0xa1, b'i', 0x01,       // "i" -> 1
-            0xa1, b's', 0x00,       // "s" -> 0
-            0xa1, b'r', 0xc0,       // "r" -> nil
-            0xa1, b'e', 0xc0,       // "e" -> nil
+            0x84, // fixmap(4)
+            0xa1, b'i', 0x01, // "i" -> 1
+            0xa1, b's', 0x00, // "s" -> 0
+            0xa1, b'r', 0xc0, // "r" -> nil
+            0xa1, b'e', 0xc0, // "e" -> nil
         ];
         assert_eq!(packed, expected);
     }

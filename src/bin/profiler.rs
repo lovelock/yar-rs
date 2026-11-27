@@ -8,11 +8,11 @@
 //! takes only `--host` and profiles whatever is listening there.
 //!
 //! CLI (all options optional, defaults shown):
-//!   --host <addr>     target Yar server                     (default 127.0.0.1:9501)
-//!   --vus <csv>       VU ladder, bare numbers, comma-list    (default 10,20,40,80,160,320,640)
-//!   --sizes <csv>     body ladder, b/k/m suffix allowed      (default 256b,1k,4k,16k,64k,256k,512k,1m,2m,4m)
-//!   --step-time <dur> per-stage duration, s/ms suffix        (default 10s)
-//!   --out <path>      CSV destination                        (default: stdout)
+//!   --host `<addr>`     target Yar server                     (default 127.0.0.1:9501)
+//!   --vus `<csv>`       VU ladder, bare numbers, comma-list    (default 10,20,40,80,160,320,640)
+//!   --sizes `<csv>`     body ladder, b/k/m suffix allowed      (default 256b,1k,4k,16k,64k,256k,512k,1m,2m,4m)
+//!   --step-time `<dur>` per-stage duration, s/ms suffix        (default 10s)
+//!   --out `<path>`      CSV destination                        (default: stdout)
 
 use std::fs::File;
 use std::process::ExitCode;
@@ -50,9 +50,11 @@ fn parse_vus_csv(s: &str) -> Result<Vec<usize>, String> {
         if token.is_empty() {
             return Err(format!("invalid --vus '{}': empty item", s));
         }
-        vus.push(token.parse().map_err(|_| {
-            format!("invalid --vus '{}': '{}' is not a number", s, token)
-        })?);
+        vus.push(
+            token
+                .parse()
+                .map_err(|_| format!("invalid --vus '{}': '{}' is not a number", s, token))?,
+        );
     }
     Ok(vus)
 }
@@ -93,7 +95,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             ("--vus", v) => args.vus = parse_vus_csv(v)?,
             ("--sizes", v) => args.sizes = parse_sizes_csv(v)?,
             ("--step-time", v) => {
-                args.step_time = parse_duration_suffix(v).map_err(|e| format!("--step-time: {e}"))?;
+                args.step_time =
+                    parse_duration_suffix(v).map_err(|e| format!("--step-time: {e}"))?;
             }
             ("--out", v) => args.out = Some(v.clone()),
             _ => unreachable!("flag was matched in the use-list above"),
@@ -170,11 +173,16 @@ mod tests {
     #[test]
     fn explicit_overrides_win() {
         let a = parse_args(&argv(&[
-            "--host", "10.0.0.5:9502",
-            "--vus", "4,8",
-            "--sizes", "1k,64k,1m",
-            "--step-time", "250ms",
-            "--out", "/tmp/report.csv",
+            "--host",
+            "10.0.0.5:9502",
+            "--vus",
+            "4,8",
+            "--sizes",
+            "1k,64k,1m",
+            "--step-time",
+            "250ms",
+            "--out",
+            "/tmp/report.csv",
         ]))
         .unwrap();
         assert_eq!(a.host, "10.0.0.5:9502");

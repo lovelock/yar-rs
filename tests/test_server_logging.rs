@@ -60,7 +60,8 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
     });
 
     assert!(
-        wait_until(Duration::from_secs(5), || read_log(&log_path).contains("Listening on")),
+        wait_until(Duration::from_secs(5), || read_log(&log_path)
+            .contains("Listening on")),
         "server never logged readiness:\n{}",
         read_log(&log_path)
     );
@@ -95,7 +96,8 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
 
     let text = read_log(&log_path);
     assert!(
-        text.lines().any(|l| l.contains("DEBUG") && l.contains("Connection closed by peer")),
+        text.lines()
+            .any(|l| l.contains("DEBUG") && l.contains("Connection closed by peer")),
         "a clean disconnect must be logged at DEBUG:\n{}",
         text
     );

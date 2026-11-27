@@ -1,26 +1,26 @@
 //! `yar-server-rust` — standalone Yar server offering an `echo` method.
 //!
 //! CLI (all options optional, defaults shown):
-//!   --host <addr>     bind address                   (default 127.0.0.1:9501)
-//!   --inflight <n>    max in-flight connections, 0 = unlimited (default 0)
-//!   --max-request-size <size>  b/k/m suffix, bare = bytes   (default 8m)
-//!   --read-timeout <dur>       s/ms suffix, bare = seconds  (default 5s)
+//!   --host `<addr>`     bind address                   (default 127.0.0.1:9501)
+//!   --inflight `<n>`    max in-flight connections, 0 = unlimited (default 1024)
+//!   --max-request-size `<size>`  b/k/m suffix, bare = bytes   (default 10m)
+//!   --read-timeout `<dur>`       s/ms suffix, bare = seconds  (default 5s)
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use yar_rs::pack::Packager;
 use yar_rs::cli::{parse_duration_suffix, parse_size_suffix};
+use yar_rs::pack::Packager;
 use yar_rs::response::YarResponse;
-use yar_rs::server::YarServer;
+use yar_rs::server::{YarServer, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_SIZE};
 
 const USAGE: &str = "\
 Usage: yar-server-rust [options]
 
 Options:
   --host <addr>              Bind address (default: 127.0.0.1:9501)
-  --inflight <n>             Max in-flight connections, 0 = unlimited (default: 0)
-  --max-request-size <size>  Max request body bytes: b/k/m suffix allowed (default: 8m)
+  --inflight <n>             Max in-flight connections, 0 = unlimited (default: 1024)
+  --max-request-size <size>  Max request body bytes: b/k/m suffix allowed (default: 10m)
   --read-timeout <dur>       Per-request read timeout: s/ms suffix allowed (default: 5s)";
 
 struct Options {
@@ -32,22 +32,25 @@ struct Options {
 
 fn parse_args(argv: &[String]) -> Result<Options, String> {
     let mut host: String = "127.0.0.1:9501".into();
-    let mut inflight = 0;
-    let mut max_request_size = parse_size_suffix("8m").expect("valid default");
+    let mut inflight = DEFAULT_MAX_INFLIGHT;
+    let mut max_request_size = DEFAULT_MAX_REQUEST_SIZE;
     let mut read_timeout = parse_duration_suffix("5s").expect("valid default");
     let mut i = 0;
     while i < argv.len() {
         let (flag, value) = match argv[i].as_str() {
             f @ ("--host" | "--inflight" | "--max-request-size" | "--read-timeout") => (
                 f,
-                argv.get(i + 1).ok_or_else(|| format!("missing value for {f}"))?,
+                argv.get(i + 1)
+                    .ok_or_else(|| format!("missing value for {f}"))?,
             ),
             other => return Err(format!("unknown argument: {other}")),
         };
         match (flag, value) {
             ("--host", v) => host = v.clone(),
             ("--inflight", v) => {
-                inflight = v.parse().map_err(|_| format!("invalid --inflight value: {v}"))?;
+                inflight = v
+                    .parse()
+                    .map_err(|_| format!("invalid --inflight value: {v}"))?;
             }
             ("--max-request-size", v) => {
                 max_request_size =

@@ -15,10 +15,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::error::{YarError, YarResult};
+use crate::logger;
 use crate::protocol::{YarHeader, HEADER_SIZE, PROTOCOL_PERSISTENT};
 use crate::request::YarRequest;
 use crate::response::YarResponse;
-use crate::logger;
 use crate::PACKAGER_NAME;
 
 pub const SERVER_NAME: &str = concat!("Yar Rust Server ", env!("CARGO_PKG_VERSION"));
@@ -175,7 +175,8 @@ where
     payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
 
     // Write PACKAGER_NAME at offset HEADER_SIZE
-    payload[HEADER_SIZE..HEADER_SIZE + PACKAGER_NAME.len()].copy_from_slice(PACKAGER_NAME.as_slice());
+    payload[HEADER_SIZE..HEADER_SIZE + PACKAGER_NAME.len()]
+        .copy_from_slice(PACKAGER_NAME.as_slice());
 
     // Send the full payload
     stream.write_all(&payload).await?;
@@ -382,12 +383,8 @@ impl YarServer {
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let _permit = permit; // released when this task returns
-                        let _ = handle_connection_with_timeout(
-                            &mut stream,
-                            &handlers,
-                            limits,
-                        )
-                        .await;
+                        let _ =
+                            handle_connection_with_timeout(&mut stream, &handlers, limits).await;
                     });
                 }
             }
@@ -422,12 +419,8 @@ impl YarServer {
                         tokio::spawn(async move {
                             let mut stream = stream;
                             let _permit = permit;
-                            let _ = handle_connection_with_timeout(
-                                &mut stream,
-                                &handlers,
-                                limits,
-                            )
-                            .await;
+                            let _ = handle_connection_with_timeout(&mut stream, &handlers, limits)
+                                .await;
                         });
                     }
                 }
@@ -451,7 +444,9 @@ fn make_semaphore(max_inflight: usize) -> Option<Arc<Semaphore>> {
     }
 }
 
-async fn acquire_permit(semaphore: &Option<Arc<Semaphore>>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+async fn acquire_permit(
+    semaphore: &Option<Arc<Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
     match semaphore {
         Some(sem) => Some(
             sem.clone()
@@ -482,9 +477,8 @@ where
             let header_bytes = read_exact_idle(stream, HEADER_SIZE, read_timeout).await?;
 
             // Parse header
-            let header = parse_header_from_wire(&header_bytes).map_err(|_| {
-                YarError::InvalidMagic
-            })?;
+            let header =
+                parse_header_from_wire(&header_bytes).map_err(|_| YarError::InvalidMagic)?;
 
             let is_persistent = (header.reserved & PROTOCOL_PERSISTENT) != 0;
             let body_len = header.body_len as usize;
@@ -570,18 +564,11 @@ where
                 let resp = YarResponse::error(
                     req_id as u64,
                     1,
-                    &format!(
-                        "request too large: {} > {}",
-                        declared_len, max_request_size
-                    ),
+                    &format!("request too large: {} > {}", declared_len, max_request_size),
                 );
-                let _ = send_response_with_timeout(
-                    stream,
-                    &resp,
-                    extra_bytes,
-                    limits.write_timeout,
-                )
-                .await;
+                let _ =
+                    send_response_with_timeout(stream, &resp, extra_bytes, limits.write_timeout)
+                        .await;
                 return Ok(());
             }
         };
@@ -595,7 +582,10 @@ where
         if &body_bytes[..PACKAGER_NAME.len()] != PACKAGER_NAME.as_slice() {
             logger::log_global(
                 logger::LogLevel::Error,
-                &format!("Unsupported packager: {:?}", &body_bytes[..PACKAGER_NAME.len()]),
+                &format!(
+                    "Unsupported packager: {:?}",
+                    &body_bytes[..PACKAGER_NAME.len()]
+                ),
             );
             return Ok(());
         }
@@ -606,13 +596,9 @@ where
             Err(e) => {
                 logger::log_global(logger::LogLevel::Error, &format!("Unpack failed: {}", e));
                 let resp = YarResponse::error(header.id as u64, 1, &e.to_string());
-                let _ = send_response_with_timeout(
-                    stream,
-                    &resp,
-                    extra_bytes,
-                    limits.write_timeout,
-                )
-                .await;
+                let _ =
+                    send_response_with_timeout(stream, &resp, extra_bytes, limits.write_timeout)
+                        .await;
                 return Ok(());
             }
         };
@@ -667,13 +653,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use byteorder::{BigEndian, ByteOrder};
     use crate::pack::Packager;
+    use byteorder::{BigEndian, ByteOrder};
     use tokio::net::TcpStream;
 
     /// Build a complete Yar wire packet (header + packager_name + msgpack body).
     /// Constructs wire-format header bytes directly to avoid byte-order issues.
-    fn build_request_packet(id: u32, method: &str, params_pk: Option<Packager>, persistent: bool) -> Vec<u8> {
+    fn build_request_packet(
+        id: u32,
+        method: &str,
+        params_pk: Option<Packager>,
+        persistent: bool,
+    ) -> Vec<u8> {
         let mut req = YarRequest::new(id as u64, method);
         if let Some(pk) = params_pk {
             req.set_parameters(pk);
@@ -709,9 +700,8 @@ mod tests {
         if data.len() < HEADER_SIZE {
             return Err(YarError::Protocol("response too short for header".into()));
         }
-        let header = parse_header_from_wire(&data[..HEADER_SIZE]).map_err(|_| {
-            YarError::InvalidMagic
-        })?;
+        let header =
+            parse_header_from_wire(&data[..HEADER_SIZE]).map_err(|_| YarError::InvalidMagic)?;
         let body = data[HEADER_SIZE..].to_vec();
         Ok((header, body))
     }
@@ -741,11 +731,13 @@ mod tests {
 
         let server = YarServer::new("127.0.0.1:9998");
         rt.block_on(async {
-            server.register_handler("echo", |req| {
-                let mut pk = Packager::new();
-                pk.push_string(req.method().as_bytes()).unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+            server
+                .register_handler("echo", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(req.method().as_bytes()).unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         });
 
         // Verify the handler was registered by checking the handlers map.
@@ -760,11 +752,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = YarServer::new(&format!("127.0.0.1:{}", addr.port()));
-        server.register_handler("hello", |req| {
-            let mut pk = Packager::new();
-            pk.push_string(b"world").unwrap();
-            YarResponse::success(req.id(), pk)
-        }).await;
+        server
+            .register_handler("hello", |req| {
+                let mut pk = Packager::new();
+                pk.push_string(b"world").unwrap();
+                YarResponse::success(req.id(), pk)
+            })
+            .await;
 
         let handlers = server.handlers.clone();
 
@@ -775,13 +769,17 @@ mod tests {
 
             // Read header
             let mut header_buf = vec![0u8; HEADER_SIZE];
-            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header_buf).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut header_buf)
+                .await
+                .unwrap();
             let header = parse_header_from_wire(&header_buf).unwrap();
 
             // Read body
             let body_len = header.body_len as usize;
             let mut body_buf = vec![0u8; body_len];
-            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body_buf).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body_buf)
+                .await
+                .unwrap();
 
             // Verify packager name
             assert_eq!(&body_buf[..PACKAGER_NAME.len()], PACKAGER_NAME.as_slice());
@@ -804,11 +802,16 @@ mod tests {
             let body_len = (payload.len() - HEADER_SIZE) as u32;
             let header_bytes = build_response_header_bytes(response.id as u32, body_len);
             payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
-            payload[HEADER_SIZE..HEADER_SIZE + PACKAGER_NAME.len()].copy_from_slice(PACKAGER_NAME.as_slice());
+            payload[HEADER_SIZE..HEADER_SIZE + PACKAGER_NAME.len()]
+                .copy_from_slice(PACKAGER_NAME.as_slice());
 
-            tokio::io::AsyncWriteExt::write_all(&mut writer, &payload).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+                .await
+                .unwrap();
             tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
-            tokio::io::AsyncWriteExt::shutdown(&mut writer).await.unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut writer)
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -955,18 +958,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = YarServer::new(&format!("127.0.0.1:{}", addr.port()));
-        server.register_handler("add", |req| {
-            let params = req.get_parameters();
-            let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
-            let sum: i64 = arr
-                .iter()
-                .filter_map(|v| v.as_integer())
-                .sum();
+        server
+            .register_handler("add", |req| {
+                let params = req.get_parameters();
+                let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
+                let sum: i64 = arr.iter().filter_map(|v| v.as_integer()).sum();
 
-            let mut pk = Packager::new();
-            pk.push_long(sum).unwrap();
-            YarResponse::success(req.id(), pk)
-        }).await;
+                let mut pk = Packager::new();
+                pk.push_long(sum).unwrap();
+                YarResponse::success(req.id(), pk)
+            })
+            .await;
 
         let server_handle = tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.unwrap();

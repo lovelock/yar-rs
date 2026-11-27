@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 传入格式 | 行为 |
 |---|---|
 | `host:port` | TCP 连接（**必须带端口号**，如 `127.0.0.1:9501`） |
-| `/path/to.sock` | Unix domain socket（客户端支持，服务端暂不支持） |
+| `/path/to.sock` | Unix domain socket（仅 Unix 平台；Windows 上返回错误） |
 | `localhost`（无端口） | 返回 `Connection("hostname must include port")` |
 | `http://…` / `https://…` | 返回 `Connection("HTTP/HTTPS not supported ...")` |
 
@@ -52,8 +52,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 client.set_timeout(Duration::from_secs(3)); // 读/写超时，默认 5 秒
+client.set_max_response_size(10 * 1024 * 1024); // 响应体上限，默认 10 MiB
 client.set_persistent(true);                // 见下文
 ```
+
+如果需要限制建立连接的时间，使用
+`YarClient::connect_with_timeout(host, Duration)`；默认 TCP 建连超时为 5 秒。
+连接成功后才能拿到 client，因此建连超时只能在 `connect*` 时设置。
 
 ### ⚠️ 重要的生命周期语义（与原 C 客户端一致）
 
@@ -140,7 +145,7 @@ match YarClient::connect("http://example.com:8080") {
 `YarClient::call` 是**阻塞 IO**（与 C 客户端一致的同步 API）。
 在 Tokio 异步函数里请勿直接调用（会阻塞工作线程），应使用 `spawn_blocking`：
 
-```rust
+```text
 // tokio::task::spawn_blocking
 let client = YarClient::connect("127.0.0.1:9501")?;
 let resp = tokio::task::spawn_blocking(move || {

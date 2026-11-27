@@ -95,9 +95,9 @@ impl YarRequest {
         let root = unpk.data();
 
         // The top-level must be a Map.
-        let map = root.as_map().ok_or_else(|| {
-            YarError::Protocol("request payload is not a msgpack map".into())
-        })?;
+        let map = root
+            .as_map()
+            .ok_or_else(|| YarError::Protocol("request payload is not a msgpack map".into()))?;
 
         if map.len() < 2 {
             return Err(YarError::Protocol(

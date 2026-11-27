@@ -4,8 +4,8 @@
 
 ## 前置要求
 
-- Rust 稳定版工具链（建议 1.75+）
-- 服务端基于 [Tokio](https://tokio.rs)：项目 `Cargo.toml` 只需引入 `yar-rs` 一个依赖即可
+- Rust 稳定版工具链（MSRV 1.85）
+- 服务端基于 [Tokio](https://tokio.rs)：除了 `yar-rs`，还需要引入 Tokio 运行时
 
 添加依赖：
 

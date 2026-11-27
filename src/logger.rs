@@ -92,12 +92,10 @@ impl YarLogger {
                         .arg(cmd)
                         .stdin(Stdio::piped())
                         .spawn()?;
-                    let stdin = c.stdin.take().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "failed to open pipe stdin",
-                        )
-                    })?;
+                    let stdin = c
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("failed to open pipe stdin"))?;
                     (LoggerOutput::Pipe(stdin), Some(c))
                 }
                 #[cfg(not(unix))]
@@ -191,7 +189,7 @@ pub fn init_global(path: Option<&str>, level: LogLevel) -> Result<(), std::io::E
     let logger = YarLogger::init(path, level)?;
     GLOBAL_LOGGER
         .set(logger)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "global logger already set"))
+        .map_err(|_| std::io::Error::other("global logger already set"))
 }
 
 /// Set the hostname on the global logger.
@@ -249,7 +247,10 @@ mod tests {
         let mut f = File::open(&path).unwrap();
         f.read_to_string(&mut contents).unwrap();
 
-        assert!(!contents.contains("debug msg"), "debug should be suppressed");
+        assert!(
+            !contents.contains("debug msg"),
+            "debug should be suppressed"
+        );
         assert!(
             !contents.contains("notice msg"),
             "notice should be suppressed"
@@ -357,11 +358,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "yar_logger_test_{}_{}.log",
-            std::process::id(),
-            id
-        ));
+        let path =
+            std::env::temp_dir().join(format!("yar_logger_test_{}_{}.log", std::process::id(), id));
         let _ = std::fs::remove_file(&path);
         File::create(&path)?;
         Ok(TempFile { path })

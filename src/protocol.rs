@@ -1,8 +1,9 @@
 //! Yar protocol header - binary compatible with the C implementation.
 //!
-//! The header is packed (no padding), with fields stored in network byte order
-//! (big-endian) on the wire. The C struct comment says "Total: 80 bytes" but
-//! the actual fields sum to 82 (4+2+4+4+32+32+4).
+//! The header has no padding on the wire and numeric fields are big-endian.
+//! [`YarHeader`] stores them in host byte order; [`YarHeader::to_bytes`] and
+//! [`YarHeader::from_bytes`] handle the conversion. The C struct comment says
+//! "Total: 80 bytes" but the actual fields sum to 82 (4+2+4+4+32+32+4).
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -27,8 +28,8 @@ const _: () = assert!(HEADER_SIZE == 4 + 2 + 4 + 4 + 32 + 32 + 4);
 
 /// Yar protocol header, matching the C `yar_header` struct fields.
 ///
-/// All numeric fields are stored in **host byte order**. Use [`to_bytes`] to
-/// produce wire format and [`from_bytes`] to parse it. This keeps the public
+/// All numeric fields are stored in **host byte order**. Use [`YarHeader::to_bytes`] to
+/// produce wire format and [`YarHeader::from_bytes`] to parse it. This keeps the public
 /// type free of the packed/unaligned-field hazards of a direct C layout.
 ///
 /// Layout on the wire (packed, no padding):
@@ -36,8 +37,8 @@ const _: () = assert!(HEADER_SIZE == 4 + 2 + 4 + 4 + 32 + 32 + 4);
 ///   version:    2 bytes  (unsigned short)
 ///   magic_num:  4 bytes  (unsigned int)
 ///   reserved:   4 bytes  (unsigned int)
-///   provider:  32 bytes  (unsigned char[32])
-///   token:     32 bytes  (unsigned char[32])
+///   provider:  32 bytes  (`unsigned char[32]`)
+///   token:     32 bytes  (`unsigned char[32]`)
 ///   body_len:   4 bytes  (unsigned int)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YarHeader {
@@ -89,7 +90,7 @@ impl YarHeader {
     /// Validate the magic number and convert an in-place wire-order header to
     /// host byte order.
     ///
-    /// A header produced by [`render`]/[`new`] is already in host order and
+    /// A header produced by [`YarHeader::render`]/[`YarHeader::new`] is already in host order and
     /// only needs validation. This method exists for callers that received raw
     /// struct bytes from the C API.
     pub fn parse(&mut self) -> YarResult<()> {

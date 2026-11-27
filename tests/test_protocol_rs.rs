@@ -3,8 +3,8 @@
 //! These tests verify that the Rust protocol implementation produces
 //! wire-compatible bytes with the C yar_protocol implementation.
 
-use yar_rs::*;
 use byteorder::{BigEndian, ByteOrder};
+use yar_rs::*;
 
 // ---------------------------------------------------------------------------
 // Header size
@@ -74,7 +74,13 @@ fn test_render_produces_c_compatible_bytes() {
 #[test]
 fn test_render_with_provider_and_token() {
     let mut header = YarHeader::new();
-    header.render(42, Some("my-provider"), Some("my-token"), 1024, PROTOCOL_PERSISTENT);
+    header.render(
+        42,
+        Some("my-provider"),
+        Some("my-token"),
+        1024,
+        PROTOCOL_PERSISTENT,
+    );
 
     let raw = header.to_bytes();
 
@@ -145,13 +151,13 @@ fn test_from_bytes_parses_c_wire_format() {
     // Construct bytes exactly as C would lay them out on the wire
     let mut buf = vec![0u8; HEADER_SIZE];
 
-    BigEndian::write_u32(&mut buf[0..4], 42);           // id
-    BigEndian::write_u16(&mut buf[4..6], 2);            // version
+    BigEndian::write_u32(&mut buf[0..4], 42); // id
+    BigEndian::write_u16(&mut buf[4..6], 2); // version
     BigEndian::write_u32(&mut buf[6..10], PROTOCOL_MAGIC); // magic
     BigEndian::write_u32(&mut buf[10..14], PROTOCOL_PERSISTENT); // reserved
-    buf[14..19].copy_from_slice(b"hello");               // provider
-    buf[46..51].copy_from_slice(b"world");               // token
-    BigEndian::write_u32(&mut buf[78..82], 512);         // body_len
+    buf[14..19].copy_from_slice(b"hello"); // provider
+    buf[46..51].copy_from_slice(b"world"); // token
+    BigEndian::write_u32(&mut buf[78..82], 512); // body_len
 
     let header = YarHeader::from_bytes(&buf).unwrap();
     assert_eq!(header.id, 42);
@@ -297,11 +303,11 @@ fn test_combined_flags_in_reserved() {
 fn test_wire_byte_layout_matches_c() {
     // Build a complete wire-format header as C would produce it
     let mut wire = vec![0u8; HEADER_SIZE];
-    BigEndian::write_u32(&mut wire[0..4], 0x12345678);  // id
-    BigEndian::write_u16(&mut wire[4..6], 0x0001);      // version
+    BigEndian::write_u32(&mut wire[0..4], 0x12345678); // id
+    BigEndian::write_u16(&mut wire[4..6], 0x0001); // version
     BigEndian::write_u32(&mut wire[6..10], PROTOCOL_MAGIC); // magic
     BigEndian::write_u32(&mut wire[10..14], 0x00000003); // reserved (PERSISTENT|PING)
-    // provider at 14..46: "test\0..." (only first 4 bytes non-zero)
+                                                         // provider at 14..46: "test\0..." (only first 4 bytes non-zero)
     wire[14..18].copy_from_slice(b"test");
     // token at 46..78: all zeros
     BigEndian::write_u32(&mut wire[78..82], 0x00000100); // body_len = 256
@@ -336,7 +342,7 @@ fn test_packager_name_constant() {
 
 #[test]
 fn test_version_constant() {
-    assert_eq!(yar_rs::VERSION, "0.1.0");
+    assert_eq!(yar_rs::VERSION, env!("CARGO_PKG_VERSION"));
 }
 
 // ---------------------------------------------------------------------------

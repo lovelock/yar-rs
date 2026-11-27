@@ -35,7 +35,11 @@ fn wait_for_port(port: u16) {
 /// Returns the JoinHandle for cleanup.
 fn start_server(
     port: u16,
-    setup: impl FnOnce(&mut YarServer) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> + Send + 'static,
+    setup: impl FnOnce(
+            &mut YarServer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>
+        + Send
+        + 'static,
 ) -> std::thread::JoinHandle<()> {
     let addr = format!("127.0.0.1:{}", port);
     std::thread::spawn(move || {
@@ -76,12 +80,13 @@ fn test_concurrent_server_start_same_process() {
             let result = rt.block_on(async {
                 let mut server = YarServer::new(&addr);
                 server.set_max_request_size(4096);
-                server.register_handler("echo", |req| {
-                    let mut pk = Packager::new();
-                    pk.push_string(b"echo:ok").unwrap();
-                    YarResponse::success(req.id(), pk)
-                })
-                .await;
+                server
+                    .register_handler("echo", |req| {
+                        let mut pk = Packager::new();
+                        pk.push_string(b"echo:ok").unwrap();
+                        YarResponse::success(req.id(), pk)
+                    })
+                    .await;
                 // Align both run() calls so the concurrent init race is hit.
                 barrier.wait();
                 server.run().await
@@ -131,11 +136,13 @@ fn test_oversized_request_rejected_before_reading_body() {
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
             server.set_max_request_size(1024);
-            server.register_handler("echo", |req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"echo:ok").unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+            server
+                .register_handler("echo", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"echo:ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -146,16 +153,18 @@ fn test_oversized_request_rejected_before_reading_body() {
     // Constructed as the C client would produce it (see test_cross_language).
     let mut header_bytes = vec![0u8; HEADER_SIZE];
     use byteorder::{BigEndian, ByteOrder};
-    BigEndian::write_u32(&mut header_bytes[0..4], 42);              // id
-    BigEndian::write_u16(&mut header_bytes[4..6], 0);               // version
+    BigEndian::write_u32(&mut header_bytes[0..4], 42); // id
+    BigEndian::write_u16(&mut header_bytes[4..6], 0); // version
     BigEndian::write_u32(&mut header_bytes[6..10], PROTOCOL_MAGIC); // magic
-    BigEndian::write_u32(&mut header_bytes[10..14], 0);             // reserved
-    // provider[14..46] stays zero
-    // token[46..78] stays zero
-    BigEndian::write_u32(&mut header_bytes[78..82], 2048);          // body_len
+    BigEndian::write_u32(&mut header_bytes[10..14], 0); // reserved
+                                                        // provider[14..46] stays zero
+                                                        // token[46..78] stays zero
+    BigEndian::write_u32(&mut header_bytes[78..82], 2048); // body_len
 
     let mut stream = std::net::TcpStream::connect(&addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     stream.write_all(&header_bytes).unwrap();
     stream.flush().unwrap();
 
@@ -171,7 +180,11 @@ fn test_oversized_request_rejected_before_reading_body() {
         }
     }
 
-    assert!(raw.len() >= HEADER_SIZE, "expected at least a response header, got {} bytes", raw.len());
+    assert!(
+        raw.len() >= HEADER_SIZE,
+        "expected at least a response header, got {} bytes",
+        raw.len()
+    );
 
     // Parse the response header and body (via unaligned reads — YarHeader is packed)
     let header = YarHeader::from_bytes(&raw[..HEADER_SIZE]).unwrap();
@@ -200,11 +213,13 @@ fn test_request_within_limit_still_served() {
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
             server.set_max_request_size(1024);
-            server.register_handler("echo", |req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"echo:ok").unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+            server
+                .register_handler("echo", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"echo:ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -240,13 +255,13 @@ fn build_raw_request(id: u32, persistent: bool) -> Vec<u8> {
     };
 
     let mut header_bytes = vec![0u8; HEADER_SIZE];
-    BigEndian::write_u32(&mut header_bytes[0..4], id);              // id
-    BigEndian::write_u16(&mut header_bytes[4..6], 0);              // version
+    BigEndian::write_u32(&mut header_bytes[0..4], id); // id
+    BigEndian::write_u16(&mut header_bytes[4..6], 0); // version
     BigEndian::write_u32(&mut header_bytes[6..10], PROTOCOL_MAGIC); // magic
     let reserved = if persistent { PROTOCOL_PERSISTENT } else { 0 };
-    BigEndian::write_u32(&mut header_bytes[10..14], reserved);     // reserved
-    // provider[14..46] stays zeroed
-    // token[46..78] stays zeroed
+    BigEndian::write_u32(&mut header_bytes[10..14], reserved); // reserved
+                                                               // provider[14..46] stays zeroed
+                                                               // token[46..78] stays zeroed
     BigEndian::write_u32(&mut header_bytes[78..82], body.len() as u32); // body_len
 
     let mut packet = header_bytes;
@@ -262,11 +277,13 @@ fn test_max_inflight_gates_concurrent_connections() {
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
             server.set_max_inflight(1);
-            server.register_handler("echo", |req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"echo:ok").unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+            server
+                .register_handler("echo", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"echo:ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -286,15 +303,18 @@ fn test_max_inflight_gates_concurrent_connections() {
     // conn2: also persistent. Its request must wait (not be served) while
     // conn1 holds the only permit.
     let mut conn2 = std::net::TcpStream::connect(&addr).unwrap();
-    conn2.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     conn2.write_all(&build_raw_request(102, true)).unwrap();
     conn2.flush().unwrap();
 
     let not_served_start = Instant::now();
     let mut probe = [0u8; HEADER_SIZE];
     match conn2.read(&mut probe) {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-            || e.kind() == std::io::ErrorKind::TimedOut => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {}
         other => panic!(
             "conn2 was served while conn1 held the only permit ({}ms elapsed; read result: {:?})",
             not_served_start.elapsed().as_millis(),
@@ -306,7 +326,9 @@ fn test_max_inflight_gates_concurrent_connections() {
     drop(conn1);
 
     let served_deadline = Instant::now() + Duration::from_secs(2);
-    conn2.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     let mut received = Vec::new();
     loop {
         if Instant::now() >= served_deadline {
@@ -322,8 +344,12 @@ fn test_max_inflight_gates_concurrent_connections() {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(e) => panic!("conn2 read failed while waiting to be served: {:?}", e),
         }
     }

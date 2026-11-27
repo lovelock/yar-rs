@@ -99,8 +99,12 @@ fn trickling_body_is_not_cut_off_by_the_idle_timeout() {
 
     let payload = build_request(&[b'x'; 4096]);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Header first, then the body in 8 chunks with 100 ms gaps: every gap is
     // well under the 300 ms idle timeout, but the request as a whole takes

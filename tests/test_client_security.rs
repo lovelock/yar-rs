@@ -5,9 +5,7 @@ use std::net::TcpListener;
 use std::thread;
 
 use byteorder::{BigEndian, ByteOrder};
-use yar_rs::{
-    Packager, YarClient, YarResponse, HEADER_SIZE, PACKAGER_NAME, PROTOCOL_MAGIC,
-};
+use yar_rs::{Packager, YarClient, YarResponse, HEADER_SIZE, PACKAGER_NAME, PROTOCOL_MAGIC};
 
 /// Spawn a one-shot fake server that answers any request with `body`.
 /// `body_len_override` lets a test lie about the body length.

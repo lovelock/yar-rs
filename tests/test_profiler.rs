@@ -73,7 +73,7 @@ fn test_percentile_ramp_1_to_1000() {
         p99
     );
     // p99.9: rank 998.001 -> 999.001
-    assert_close(percentile(&v, 99.9), 999.001, "p99.9");    // exact endpoints
+    assert_close(percentile(&v, 99.9), 999.001, "p99.9"); // exact endpoints
     assert_eq!(percentile(&v, 0.0), 1.0);
     assert_eq!(percentile(&v, 100.0), 1000.0);
 }
@@ -224,12 +224,16 @@ fn test_write_csv_escapes_first_error() {
     // Comma only.
     let mut buf: Vec<u8> = Vec::new();
     write_csv(&[stage(1, 1, "conn reset, retry")], &mut buf).unwrap();
-    assert!(String::from_utf8(buf).unwrap().contains(",\"conn reset, retry\","));
+    assert!(String::from_utf8(buf)
+        .unwrap()
+        .contains(",\"conn reset, retry\","));
 
     // Double quote -> doubled inside a quoted field.
     let mut buf: Vec<u8> = Vec::new();
     write_csv(&[stage(1, 1, "say \"hi\"")], &mut buf).unwrap();
-    assert!(String::from_utf8(buf).unwrap().contains(",\"say \"\"hi\"\"\","));
+    assert!(String::from_utf8(buf)
+        .unwrap()
+        .contains(",\"say \"\"hi\"\"\","));
 
     // Newline -> quoted; the raw LF stays as quoted data, so the buffer
     // contains header-\n + the embedded data-\n + the record-\n.
@@ -333,9 +337,7 @@ fn test_end_to_end_profile_two_stages() {
         assert_eq!(
             r.fail, 0,
             "stage {} (size {}) had failures: {}",
-            idx,
-            r.body_size,
-            r.first_error
+            idx, r.body_size, r.first_error
         );
     }
 
@@ -350,7 +352,10 @@ fn test_end_to_end_profile_two_stages() {
     );
 
     assert!(small.start_ts > 0, "start_ts must be an epoch second");
-    assert!(large.end_ts >= large.start_ts, "stage window must be ordered");
+    assert!(
+        large.end_ts >= large.start_ts,
+        "stage window must be ordered"
+    );
     assert!(small.end_ts >= small.start_ts);
 
     // CSV output starts with the fixed header.

@@ -466,7 +466,10 @@ fn doc_lowlevel_request_response_roundtrip() {
     let resp_bytes = resp.pack(0).unwrap();
     let parsed_resp = YarResponse::unpack(&resp_bytes, 0).unwrap();
     assert_eq!(parsed_resp.get_status(), 0);
-    assert_eq!(parsed_resp.get_response().unwrap().as_str(), Some("echo:ok"));
+    assert_eq!(
+        parsed_resp.get_response().unwrap().as_str(),
+        Some("echo:ok")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +481,15 @@ fn doc_yar_header_wire() {
     use yar_rs::YarHeader;
 
     let mut header = YarHeader::new();
-    // 参数：id, provider(最多写入 16 字节), token(最多写入 16 字节), body_len, reserved(标志位)
-    header.render(1000, Some("Yar(Rust)-0.1.0"), None, 128, PROTOCOL_PERSISTENT);
-    // render() 之后的字段是网络字节序，parse() 校验魔数并转回主机序，供 to_bytes() 序列化
+    // 参数：id, provider(最多 31 字节), token(最多 31 字节), body_len, reserved(标志位)
+    header.render(
+        1000,
+        Some("Yar(Rust)-0.1.0"),
+        None,
+        128,
+        PROTOCOL_PERSISTENT,
+    );
+    // render() 后的字段已是主机序；parse() 只校验魔数（兼容从 wire 字节读入的旧用法）
     header.parse().unwrap();
 
     // 线上字节（大端）：可以直接 send 给 server / client
@@ -489,7 +498,8 @@ fn doc_yar_header_wire() {
 
     // 对端解析（校验魔数 0x80DFEC60，不匹配返回 Err）
     let parsed = YarHeader::from_bytes(&wire).unwrap();
-    let _ = parsed; // YarHeader 是 packed 结构，如需读取数值字段请从 wire 字节读取
+    assert_eq!(parsed.id, 1000);
+    assert_eq!(parsed.body_len, 128);
 
     // 从线上字节读取字段（big-endian）
     let id = u32::from_be_bytes(wire[0..4].try_into().unwrap());
@@ -504,7 +514,7 @@ fn doc_yar_header_wire() {
 
 #[test]
 fn doc_logger_usage() {
-    use yar_rs::logger::{LogLevel, init_global, log_global, set_hostname};
+    use yar_rs::logger::{init_global, log_global, set_hostname, LogLevel};
 
     // None -> stderr；其他支持文件路径追加，或 "|cmd" 管道命令
     init_global(None, LogLevel::Notice).unwrap_or(()); // 已初始化时返回 Err，首次调用成功

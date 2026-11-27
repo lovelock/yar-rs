@@ -117,7 +117,7 @@ assert_eq!(v1.as_str(), Some("e"));
 
 ## Unpackager 与 YarData
 
-```rust
+```text
 let data: YarData = Unpackager::new(some_msgpack_bytes)?.into_data();
 
 // 按需读取（Option，类型不匹配为 None）

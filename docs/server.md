@@ -15,8 +15,10 @@ async fn main() {
     let mut server = YarServer::new("127.0.0.1:9501");
 
     // --- 可选配置（必须在 run() 之前设置） ---
+    server.set_max_inflight(1024);
     server.set_read_timeout(std::time::Duration::from_secs(5));
-    server.set_max_workers(4);
+    server.set_write_timeout(std::time::Duration::from_secs(5));
+    server.set_request_timeout(Some(std::time::Duration::from_secs(30)));
     server.set_log_file("./yar_server.log");
     server.set_pid_file("./yar_server.pid");
 
@@ -39,7 +41,7 @@ async fn main() {
 | 格式 | 说明 |
 |---|---|
 | `host:port` | TCP 监听，例如 `127.0.0.1:9501`、`0.0.0.0:9501`。**必须包含端口号** |
-| `/path/to.sock` | Unix domain socket。⚠️ 当前版本服务端**尚未实现**，`run()` 会返回 `Unix domain sockets not yet implemented` 错误 |
+| `/path/to.sock` | Unix domain socket（仅 Unix 平台；Windows 上返回错误）。socket 文件由 `run()` 创建 |
 | `http://…` / `https://…` | 直接报错。Yar 使用原始 TCP 协议，不支持 HTTP 传输 |
 
 ## 注册 handler：`register_handler`
@@ -161,11 +163,13 @@ server
 
 | 方法 | 默认值 | 说明 |
 |---|---|---|
-| `set_read_timeout(Duration)` | 3 秒 | 单个请求读取的超时时间（含两次读之间）。超时后**关闭该连接** |
-| `set_max_workers(n)` | 1 | 取值范围 [1, 128]（超出会被钳制）。⚠️ 当前版本并发实际上为每连接一个 Tokio task、数量不限，该值暂不参与调度（仅作为未来 worker 模式的占位） |
-| `set_stand_alone(bool)` | `true` | Rust 版固定运行于单进程事件循环；设为 `false` 没有 daemon 行为差异（预留给未来 worker 模型） |
+| `set_max_request_size(bytes)` | 10 MiB | 请求体上限（与 C 的 `YAR_MAX_BODY_SIZE` 一致）。超限请求在读取 body 前被拒绝 |
+| `set_max_inflight(n)` | 1024 | 同时服务的连接数上限；`0` 表示不限制。超出后 accept 循环等待 |
+| `set_read_timeout(Duration)` | 3 秒 | 单次 socket 读取的 idle 超时。超时后**关闭该连接** |
+| `set_write_timeout(Duration)` | 5 秒 | 写响应的超时；客户端停止读取时不会永久占用任务 |
+| `set_request_timeout(Option<Duration>)` | 30 秒 | 接收一个完整请求（头 + body）的总时限；`None` 关闭 |
 | `set_log_file(path)` | None | 日志文件路径；未设置时输出 stderr |
-| `set_pid_file(path)` | None | 当前版本仅记录该设置，不创建文件 |
+| `set_pid_file(path)` | None | 启动时把当前进程 PID 写入该文件 |
 
 ## 连接生命周期与并发模型
 

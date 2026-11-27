@@ -105,10 +105,15 @@ pub fn run_profile(cfg: &ProfilerConfig) -> YarResult<Vec<StageReport>> {
         ));
     }
     if cfg.vus.is_empty() {
-        return Err(YarError::Connection("profiler: vus must not be empty".into()));
+        return Err(YarError::Connection(
+            "profiler: vus must not be empty".into(),
+        ));
     }
     if let Some(&v) = cfg.vus.iter().find(|&&v| v == 0) {
-        return Err(YarError::Connection(format!("profiler: VU level {} is zero", v)));
+        return Err(YarError::Connection(format!(
+            "profiler: VU level {} is zero",
+            v
+        )));
     }
     if let Some(&s) = cfg.body_sizes.iter().find(|&&s| s > MAX_BODY) {
         return Err(YarError::Connection(format!(
@@ -198,8 +203,7 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
                                     client = fresh;
                                 }
                                 Err(e) => {
-                                    outcome
-                                        .note_failure(format!("reconnect failed: {}", e));
+                                    outcome.note_failure(format!("reconnect failed: {}", e));
                                     break;
                                 }
                             }

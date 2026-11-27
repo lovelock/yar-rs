@@ -222,8 +222,7 @@ impl Packager {
 
     /// Writes a 64-bit float (always 9 bytes: 0xcb + 8 bytes).
     pub fn push_double(&mut self, val: f64) -> YarResult<()> {
-        rmp::encode::write_f64(&mut self.buffer, val)
-            .map_err(|e| YarError::Pack(e.to_string()))?;
+        rmp::encode::write_f64(&mut self.buffer, val).map_err(|e| YarError::Pack(e.to_string()))?;
         Ok(())
     }
 
@@ -461,8 +460,10 @@ impl<'a> Parser<'a> {
             }
 
             // String types - read length header then raw bytes
-            rmp::Marker::FixStr(_) | rmp::Marker::Str8
-            | rmp::Marker::Str16 | rmp::Marker::Str32 => {
+            rmp::Marker::FixStr(_)
+            | rmp::Marker::Str8
+            | rmp::Marker::Str16
+            | rmp::Marker::Str32 => {
                 let len = rmp::decode::read_str_len(&mut self.cursor)
                     .map_err(|e| YarError::Pack(e.to_string()))? as usize;
                 self.ensure_fits(len, 1, "string")?;
@@ -572,6 +573,7 @@ impl<'a> UnpackIterator<'a> {
 
     /// Advances to the next item. Returns the new position, or 0 at end.
     /// Matches C's `yar_unpack_iterator_next` which returns 0 when exhausted.
+    #[allow(clippy::should_implement_trait)] // mirrors the C API, not Iterator
     pub fn next(&mut self) -> usize {
         if self.position + 1 < self.items.len() {
             self.position += 1;
