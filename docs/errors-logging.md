@@ -1,120 +1,93 @@
-# 错误与日志
+# Errors and Logging
 
-> 本文示例在 `tests/doc_examples.rs` 中有编译校验：
-> `doc_yar_error_matching`、`doc_handler_error_response`、`doc_logger_usage`。
+[Back to the guide index](README.md)
 
-## 一、错误枚举 `YarError`
+## Errors
 
-所有客户端/底层 API 的返回值类型都是 `YarResult<T> = Result<T, YarError>`。
+Client and low-level APIs return `YarResult<T> = Result<T, YarError>`.
 
-| 错误变体 | 打印前缀 | 出现在什么场景 |
-|---|---|---|
-| `Protocol(String)` | `Protocol error:` | 收到的数据不符合协议（截断、不是 map、缺字段等），如"unexpected EOF while reading 82 bytes" |
-| `Pack(String)` | `Pack error:` | msgpack 打包/解析失败 |
-| `Io(std::io::Error)` | `IO error:` | 网络读写 IO 失败 |
-| `Connection(String)` | `Connection error:` | 连接失败；`call` 期间对端关闭（如"connection closed: expected 82 bytes, got 0" —— 非持久 client 调第二次 call 的典型症状）；`http://` 地址等 |
-| `Timeout` | `Timeout` | 连接/读写/请求超时 |
-| `InvalidMagic` | `Invalid magic number` | 对端发来的不是 Yar 协议（魔数校验失败） |
-| `UnsupportedPackager(String)` | `Unsupported packager:` | 对端使用了非 `MSGPACK\0` 的打包器名 |
-| `MethodNotFound(String)` | `Method not found:` | **服务端**未注册该方法（自动回包给客户端，客户端在 `status`/`error` 里看到此消息） |
+| Variant | When |
+|---|---|
+| `Protocol(String)` | Bytes do not follow the protocol (truncated frame, not a map, missing field, too large) |
+| `Pack(String)` | msgpack encoding/decoding failed, including parser limits |
+| `Io(std::io::Error)` | Socket read/write failure |
+| `Connection(String)` | Connect failed, peer closed, or a poisoned client was reused |
+| `Timeout` | A socket or server deadline elapsed |
+| `InvalidMagic` | The header magic does not match |
+| `UnsupportedPackager(String)` | The peer used a packager other than `MSGPACK` |
+| `MethodNotFound(String)` | The server has no handler for the method (returned as a status-8 response) |
 
-匹配示例：
+**Business errors are not `Err`.** A server-side failure is a successful
+call whose `YarResponse::get_status()` is non-zero:
 
-```rust
-use yar_rs::{YarClient, YarError};
-
-let err = YarClient::connect("http://example.com:80").unwrap_err();
-match err {
-    YarError::Connection(msg) => assert!(msg.contains("HTTP")),
-    other => panic!("expected Connection error, got {:?}", other),
+```rust,ignore
+let response = client.call("divide", vec![a, b])?; // transport/decode only
+if response.get_status() == 0 {
+    let value = response.get_response();
+} else {
+    eprintln!("status {}: {:?}", response.get_status(), response.get_error());
 }
-
-// 无端口号的 host 会被拒绝
-let err2 = YarClient::connect("localhost").unwrap_err();
-assert!(matches!(err2, YarError::Connection(_)));
 ```
 
-## 二、业务错误与传输错误的分界
+Server-generated errors use status 8 and their text is truncated to 1023
+bytes. Handler errors may use any status; `YarResponse::error(id, code,
+message)` truncates the message the same way.
 
-**业务错误不产生 `Err`，只体现在响应状态里**：
+After a transport, timeout or decode error, the client poisons the
+connection: a late response may still be in the socket. Reconnect with
+`YarClient::connect` before the next call.
 
-```text
-// 服务端 handler：
-let mut resp = YarResponse::new(req.id());
-resp.set_error(10000, "division by zero");
-return resp;                     // status != 0，客户端收到的 ok(resp) 里有错误信息
+## Logger
 
-// 客户端：
-let resp = client.call("divide", vec![a, b])?;   // 传输 OK 返回 Ok
-assert_eq!(resp.get_status(), 10000);            // 用 status 判断
-assert_eq!(resp.get_error(), Some("division by zero"));
-assert!(resp.get_response().is_none());          // 出错时没有返回值
-```
-
-错误信息按 C 的 1024 字节缓冲区截断为 1023 字节（前 1020 字节 + `"..."`）。
-服务端自动生成的错误（协议错误、未知方法、未知 packager、body 超限）统一使用
-status **8**（C 的 `YAR_ERROR`）。
-
-## 三、日志系统 `logger` 模块
-
-Yar 的日志系统是自带的独立实现（与 log/env_logger 等生态无关），格式
-（与 C 版本共享）：
+`YarLogger` writes lines in this format:
 
 ```text
 {hostname} [{YYYY-MM-DD HH:MM:SS}] {LEVEL}: {message}
 ```
 
-### 级别与过滤规则
+Levels (values match the C logger):
 
-`logger::LogLevel`（数值与 C 版对齐）：
-
-| 级别 | 数值 | 说明 |
+| Level | Value | Notes |
 |---|---:|---|
-| `LogLevel::Ok` | 0 | 访问日志（输出名 `OKEY`）；永远输出，不受阈值过滤 |
-| `LogLevel::Debug` | 1 | 调试信息 |
-| `LogLevel::Notice` | 2 | 常规通知（服务端默认阈值） |
-| `LogLevel::Warning` | 4 | 警告 |
-| `LogLevel::Error` | 8 | 错误 |
+| `LogLevel::Ok` | 0 | Access log, printed as `OKEY`; never filtered |
+| `LogLevel::Debug` | 1 | Protocol/trace details |
+| `LogLevel::Notice` | 2 | Default server threshold |
+| `LogLevel::Warning` | 4 | Warnings |
+| `LogLevel::Error` | 8 | Errors |
 
-过滤规则：`level < 阈值` 的消息被抑制；`OKEY` 永远输出。
+A message below the configured threshold is suppressed. `OKEY` is always
+emitted when an access log is enabled.
 
-### 访问日志
+The server initializes the process-global logger on `run()` from
+`set_log_file` and `set_log_level`:
 
-服务端默认对**每个完成的请求**写一条访问日志（与 C 的 `yar_server_log`
-一致）：成功为 `OKEY`，非 0 status 为 `ERROR`，消息体形如
+```rust,ignore
+server.set_log_file("/var/log/yar-rs.log"); // or "|command"; default stderr
+server.set_log_level(LogLevel::Notice);
+server.set_access_log(true);
+```
+
+You can also initialize a global logger yourself with
+`logger::init_global(path, level)`; it can only succeed once per process. A
+standalone `YarLogger::init` instance is available for local use.
+
+### Access log
+
+When `set_access_log(true)` (default), each completed request writes one
+line, matching the C server's fields:
 
 ```text
-{id} {peer} "{method}" "{provider}" {bytes_sent} {elapsed_us}      # 成功
-{id} {peer} "{method}" {error} "{provider}" {bytes_sent} -         # 失败
+<id> <peer> "<method>" "<provider>" <bytes_sent> <elapsed_us>     # success
+<id> <peer> "<method>" <error> "<provider>" <bytes_sent> -        # status != 0
 ```
 
-方法名和错误信息中的 CR/LF 会被转义，避免对端伪造日志行。压测时用
-`set_access_log(false)`（或 `yar-server-rust --no-access-log`）关闭。
+CR/LF in the method, error or provider are escaped. Disable the access log
+for benchmarks or high-volume deployments:
 
-### 全局 logger
-
-服务端 `run()` 时若全局 logger 未初始化会**自动**用配置（log_file + `Notice`）
-初始化全局 logger；也可以在自己的代码中提前初始化：
-
-```rust
-use yar_rs::logger::{init_global, set_hostname, log_global, LogLevel};
-
-// None -> stderr；其他支持文件路径追加，或 "|cmd" 管道命令
-init_global(None, LogLevel::Notice).unwrap_or(()); // 已初始化时返回 Err，首次调用成功
-set_hostname("my-yar-service");
-log_global(LogLevel::Notice, "service started");
-
-// 本地使用也可以独立实例化（不挂全局）
-let local = yar_rs::logger::YarLogger::init(None, LogLevel::Debug).unwrap();
-local.log(LogLevel::Error, "local only");
-
-assert!(local.is_enabled());
-assert_eq!(local.min_level(), LogLevel::Debug);
+```rust,ignore
+server.set_access_log(false);
+// or, for the bundled binary:
+// yar-server-rust --no-access-log
 ```
 
-注意：
-
-- `init_global` 全进程只能成功调用一次（内部用 `OnceLock`），重复调用返回
-  `Err("global logger already set")`；上面用 `.unwrap_or(())` 忽略。
-- 服务端启动时 `set_log_file` 路径可能无法创建 → `run()` 返回
-  `Protocol("Failed to initialize logger: ...")`。
+The `yar-server-rust` binary also accepts `--log-file` and `--log-level`.
