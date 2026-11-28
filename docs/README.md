@@ -16,8 +16,23 @@
 | [客户端](client.md) | `YarClient` 连接格式、超时、持久连接、参数打包与错误处理 |
 | [数据模型](data.md) | `Packager` / `Unpackager` / `YarData`，嵌套打包与迭代器 |
 | [协议与跨语言互通](protocol.md) | 线上字节格式、msgpack 帧结构、与 PHP / Java / C 客户端对接 |
-| [错误与日志](errors-logging.md) | `YarError` 枚举、`YarLogger` 日志系统 |
-| [FAQ 与迁移](faq.md) | 常见问题、C API → Rust API 对照表、已知限制 |
+| [错误与日志](errors-logging.md) | `YarError` 枚举、`YarLogger` 日志系统、访问日志格式 |
+| [FAQ 与迁移](faq.md) | 常见问题、C API → Rust API 对照表、C 兼容性差异、已知限制 |
+| [基准测试](../profile/README.md) | C vs Rust 的 k6 风格矩阵、资源对齐规则、报告列与实测结果 |
+
+## 当前实现要点
+
+- **服务端**：错误统一 status 8（C 的 `YAR_ERROR`）；每请求 OKEY/ERROR
+  访问日志（默认开启，`set_access_log(false)` 可关）；错误信息 1023 字节
+  截断；接受 `tcp://` 与 Unix socket；10 MiB 请求上限；idle 读超时、
+  请求总 deadline、响应写超时；默认 1024 在途连接上限。
+- **客户端**：1 秒默认超时（与 C 一致）；10 MiB 响应上限；packager 与
+  响应 id 校验；传输/解码失败后连接被标记为不可复用；`tcp://`；
+  `build_request_packet` + `call_raw` 支持预打包请求。
+- **解析/打包**：msgpack 深度、长度、节点数限制；`unpack` 直接移动数据；
+  request/response `pack` 只做一次整包拷贝。
+- **未实现**（刻意保留，见 [FAQ](faq.md)）：可选 JSON packager、
+  daemon/pre-fork/uid-gid。
 
 ## 推荐阅读顺序
 

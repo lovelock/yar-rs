@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/yar-rs.svg)](https://crates.io/crates/yar-rs)
 [![docs.rs](https://docs.rs/yar-rs/badge.svg)](https://docs.rs/yar-rs)
 [![CI](https://github.com/lovelock/yar-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/lovelock/yar-rs/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/lovelock/yar-rs/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/lovelock/yar-rs/blob/master/LICENSE)
 
 Rust implementation of the [Yar](https://github.com/laruence/yar) RPC framework.
 
@@ -15,15 +15,15 @@ requests from Yar clients written in PHP, Java, C, or Rust — and vice versa.
 
 ## Documentation (中文用户指南)
 
-完整的中文用户手册位于 [docs/](https://github.com/lovelock/yar-rs/blob/main/docs/README.md)：
+完整的中文用户手册位于 [docs/](https://github.com/lovelock/yar-rs/blob/master/docs/README.md)：
 
-- [快速上手](https://github.com/lovelock/yar-rs/blob/main/docs/getting-started.md)
-- [服务端指南](https://github.com/lovelock/yar-rs/blob/main/docs/server.md)
-- [客户端指南](https://github.com/lovelock/yar-rs/blob/main/docs/client.md)
-- [数据模型](https://github.com/lovelock/yar-rs/blob/main/docs/data.md)
-- [协议与跨语言互通](https://github.com/lovelock/yar-rs/blob/main/docs/protocol.md)
-- [错误与日志](https://github.com/lovelock/yar-rs/blob/main/docs/errors-logging.md)
-- [FAQ 与 C→Rust 迁移对照](https://github.com/lovelock/yar-rs/blob/main/docs/faq.md)
+- [快速上手](https://github.com/lovelock/yar-rs/blob/master/docs/getting-started.md)
+- [服务端指南](https://github.com/lovelock/yar-rs/blob/master/docs/server.md)
+- [客户端指南](https://github.com/lovelock/yar-rs/blob/master/docs/client.md)
+- [数据模型](https://github.com/lovelock/yar-rs/blob/master/docs/data.md)
+- [协议与跨语言互通](https://github.com/lovelock/yar-rs/blob/master/docs/protocol.md)
+- [错误与日志](https://github.com/lovelock/yar-rs/blob/master/docs/errors-logging.md)
+- [FAQ 与 C→Rust 迁移对照](https://github.com/lovelock/yar-rs/blob/master/docs/faq.md)
 
 指南中的示例由 `tests/doc_examples.rs` 和 doctest 覆盖；`cargo test` 会校验
 可编译的片段。
@@ -74,7 +74,7 @@ cargo build --release
 ## Example
 
 Complete runnable examples live in the
-[`examples/`](https://github.com/lovelock/yar-rs/tree/main/examples) directory:
+[`examples/`](https://github.com/lovelock/yar-rs/tree/master/examples) directory:
 
 ```sh
 cargo run --example cross_server   # in one terminal
@@ -142,7 +142,7 @@ responses.
 ## Profiler (C vs Rust benchmark)
 
 The benchmark that compares this implementation with the original C one lives
-in [`profile/`](https://github.com/lovelock/yar-rs/tree/main/profile) (not part
+in [`profile/`](https://github.com/lovelock/yar-rs/tree/master/profile) (not part
 of the published crate). It runs a k6-style matrix with one persistent
 connection per virtual user and reports attempt QPS, **successful QPS
 (`ok_qps`)**, ok/fail, p50/p95/p99/p99.9, server CPU share, memory peak and
@@ -154,11 +154,11 @@ environment variable), so neither side pays log I/O the other avoids. Every
 stage connects all VUs and warms up before measuring, and the profiler builds
 the request packet once per stage (`call_raw`) instead of repacking it per
 call. See
-[`profile/README.md`](https://github.com/lovelock/yar-rs/blob/main/profile/README.md)
+[`profile/README.md`](https://github.com/lovelock/yar-rs/blob/master/profile/README.md)
 for the parity rules, report columns and the measured matrix.
 
 ## License
 
-Apache-2.0 (see [LICENSE](https://github.com/lovelock/yar-rs/blob/main/LICENSE)).
+Apache-2.0 (see [LICENSE](https://github.com/lovelock/yar-rs/blob/master/LICENSE)).
 Yar C framework attribution is recorded in
-[NOTICE](https://github.com/lovelock/yar-rs/blob/main/NOTICE).
+[NOTICE](https://github.com/lovelock/yar-rs/blob/master/NOTICE).

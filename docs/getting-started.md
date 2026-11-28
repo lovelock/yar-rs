@@ -76,10 +76,10 @@ fn main() {
 
 | 步骤 | 关键 API | 注意事项 |
 |---|---|---|
-| 创建服务端 | `YarServer::new("host:port")` | 必须 `host:port`；不支持 `http://` |
+| 创建服务端 | `YarServer::new("host:port")` | 支持 `host:port`、`tcp://host:port`、`/path/to.sock`（Unix）；不支持 `http(s)://` |
 | 注册方法 | `server.register_handler("名", 闭包).await` | 同名注册会**静默覆盖**旧方法 |
 | 启动 | `server.run().await` | 不会返回，直到出错 |
-| 连接 | `YarClient::connect("host:port")` | 同样不支持 `http://` |
+| 连接 | `YarClient::connect("host:port")` | 支持 `tcp://host:port` 与 Unix socket；不支持 `http(s)://` |
 | 调用 | `client.call("方法", 参数列表)` | 返回 `YarResult<YarResponse>` |
 | 读结果 | `resp.get_status()` / `.get_response()` / `.get_error()` | **status == 0 才算成功** |
 | 释放 | `client.close()` | 消费 client 并关闭连接 |
