@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -36,6 +36,10 @@ pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default total deadline for receiving one request (header + body).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Status code C `yar_server` uses for every server-generated error
+/// (`YAR_ERROR` in yar_common.h, value 0x8).
+pub const SERVER_ERROR_STATUS: i64 = 8;
+
 /// Handler function type: takes request, returns response.
 pub type YarHandler = Box<dyn Fn(&YarRequest) -> YarResponse + Send + Sync>;
 
@@ -51,6 +55,7 @@ pub struct YarServer {
     log_file: Option<String>,
     log_level: logger::LogLevel,
     pid_file: Option<String>,
+    access_log: bool,
 }
 
 /// Per-connection limits copied into each connection task.
@@ -60,6 +65,7 @@ struct ConnectionLimits {
     read_timeout: Duration,
     write_timeout: Duration,
     request_timeout: Option<Duration>,
+    access_log: bool,
 }
 
 // -- Private helpers ---------------------------------------------------------
@@ -78,6 +84,7 @@ fn parse_address(hostname: &str) -> YarResult<Address> {
             "HTTP/HTTPS URIs are not supported".into(),
         ));
     }
+    let hostname = hostname.strip_prefix("tcp://").unwrap_or(hostname);
     Ok(Address::Tcp(hostname.to_string()))
 }
 
@@ -154,12 +161,28 @@ fn build_response_header_bytes(id: u32, body_len: u32) -> Vec<u8> {
     header.to_bytes()
 }
 
+/// Convert a wire `provider` field to a display string (up to the first NUL).
+fn provider_str(provider: &[u8; 32]) -> String {
+    let end = provider.iter().position(|&b| b == 0).unwrap_or(32);
+    let s = String::from_utf8_lossy(&provider[..end]).into_owned();
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s
+    }
+}
+
+/// Escape CR/LF so a peer-controlled field cannot forge an extra log line.
+fn escape_log_field(s: &str) -> String {
+    s.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 /// Send a response back to the client.
 async fn send_response<S>(
     stream: &mut S,
     response: &YarResponse,
     extra_bytes: usize,
-) -> YarResult<()>
+) -> YarResult<usize>
 where
     S: AsyncWriteExt + Unpin,
 {
@@ -176,9 +199,10 @@ where
         .copy_from_slice(PACKAGER_NAME.as_slice());
 
     // Send the full payload
+    let len = payload.len();
     stream.write_all(&payload).await?;
     stream.flush().await?;
-    Ok(())
+    Ok(len)
 }
 
 /// Send a response with a write deadline, returning `Timeout` if the peer
@@ -188,7 +212,7 @@ async fn send_response_with_timeout<S>(
     response: &YarResponse,
     extra_bytes: usize,
     timeout: Duration,
-) -> YarResult<()>
+) -> YarResult<usize>
 where
     S: AsyncWriteExt + Unpin,
 {
@@ -221,6 +245,7 @@ impl YarServer {
             log_file: None,
             log_level: logger::LogLevel::Notice,
             pid_file: None,
+            access_log: true,
         }
     }
 
@@ -284,6 +309,19 @@ impl YarServer {
         self.log_file = Some(path.to_string());
     }
 
+    /// Sets the minimum log level.
+    pub fn set_log_level(&mut self, level: logger::LogLevel) {
+        self.log_level = level;
+    }
+
+    /// Enables or disables the per-request access log.
+    ///
+    /// Enabled by default, matching the C server's OKEY/ERROR line per
+    /// request. Benchmarks turn it off on both sides.
+    pub fn set_access_log(&mut self, enabled: bool) {
+        self.access_log = enabled;
+    }
+
     /// Sets the PID file path; the PID is written after the listener binds.
     pub fn set_pid_file(&mut self, path: &str) {
         self.pid_file = Some(path.to_string());
@@ -328,6 +366,7 @@ impl YarServer {
             read_timeout: self.read_timeout,
             write_timeout: self.write_timeout,
             request_timeout: self.request_timeout,
+            access_log: self.access_log,
         };
         let max_inflight = self.max_inflight;
         let address = parse_address(&self.hostname)?;
@@ -365,19 +404,23 @@ impl YarServer {
                         }
                     };
 
-                    logger::log_global(
-                        logger::LogLevel::Debug,
-                        &format!("Connection from {}", peer),
-                    );
+                    if logger::enabled(logger::LogLevel::Debug) {
+                        logger::log_global(
+                            logger::LogLevel::Debug,
+                            &format!("Connection from {}", peer),
+                        );
+                    }
 
                     let handlers = handlers.clone();
                     let permit = acquire_permit(&semaphore).await;
+                    let peer = peer.to_string();
 
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let _permit = permit; // released when this task returns
                         let _ =
-                            handle_connection_with_timeout(&mut stream, &handlers, limits).await;
+                            handle_connection_with_timeout(&mut stream, &peer, &handlers, limits)
+                                .await;
                     });
                 }
             }
@@ -413,8 +456,13 @@ impl YarServer {
                         tokio::spawn(async move {
                             let mut stream = stream;
                             let _permit = permit;
-                            let _ = handle_connection_with_timeout(&mut stream, &handlers, limits)
-                                .await;
+                            let _ = handle_connection_with_timeout(
+                                &mut stream,
+                                "unix:0",
+                                &handlers,
+                                limits,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -463,6 +511,7 @@ async fn acquire_permit(
 /// Wrapper around handle_connection that applies per-request timeouts.
 async fn handle_connection_with_timeout<S>(
     stream: &mut S,
+    peer: &str,
     handlers: &Arc<RwLock<HashMap<String, YarHandler>>>,
     limits: ConnectionLimits,
 ) -> YarResult<()>
@@ -474,6 +523,7 @@ where
 
     // One read cycle per request.
     loop {
+        let req_start = Instant::now();
         let read_future = async {
             // Read header
             let header_bytes = read_exact_idle(stream, HEADER_SIZE, read_timeout).await?;
@@ -546,6 +596,7 @@ where
             }
         };
 
+        let header_provider = header.provider;
         let extra_bytes = HEADER_SIZE + PACKAGER_NAME.len();
 
         // Reject oversized requests without reading their body: reply with an
@@ -565,7 +616,7 @@ where
                 );
                 let resp = YarResponse::error(
                     req_id as u64,
-                    1,
+                    SERVER_ERROR_STATUS,
                     &format!("request too large: {} > {}", declared_len, max_request_size),
                 );
                 let _ =
@@ -581,15 +632,32 @@ where
             return Ok(());
         }
 
-        if &body_bytes[..PACKAGER_NAME.len()] != PACKAGER_NAME.as_slice() {
+        if body_bytes[..PACKAGER_NAME.len() - 1] != PACKAGER_NAME[..PACKAGER_NAME.len() - 1] {
+            let tag = &body_bytes[..PACKAGER_NAME.len()];
+            let tag_str = String::from_utf8_lossy(tag)
+                .trim_end_matches('\0')
+                .to_string();
+            let message = if tag.starts_with(b"JSON") {
+                // Same text C returns when built without cJSON.
+                "package protocol JSON is not supported, rebuild with cJSON to enable it"
+                    .to_string()
+            } else {
+                format!(
+                    "package protocol {} is not supported, only msgpack and JSON do",
+                    tag_str
+                )
+            };
             logger::log_global(
                 logger::LogLevel::Error,
-                &format!(
-                    "Unsupported packager: {:?}",
-                    &body_bytes[..PACKAGER_NAME.len()]
-                ),
+                &format!("Unsupported packager: {:?}", tag),
             );
-            return Ok(());
+            let resp = YarResponse::error(header.id as u64, SERVER_ERROR_STATUS, &message);
+            let _ =
+                send_response_with_timeout(stream, &resp, extra_bytes, limits.write_timeout).await;
+            if !is_persistent {
+                return Ok(());
+            }
+            continue;
         }
 
         // Unpack request (skip the PACKAGER_NAME prefix in the body)
@@ -597,7 +665,8 @@ where
             Ok(r) => r,
             Err(e) => {
                 logger::log_global(logger::LogLevel::Error, &format!("Unpack failed: {}", e));
-                let resp = YarResponse::error(header.id as u64, 1, &e.to_string());
+                let resp =
+                    YarResponse::error(header.id as u64, SERVER_ERROR_STATUS, &e.to_string());
                 let _ =
                     send_response_with_timeout(stream, &resp, extra_bytes, limits.write_timeout)
                         .await;
@@ -605,25 +674,31 @@ where
             }
         };
 
-        let method = request.method().to_string();
+        let method = request.method();
         let req_id = request.id();
 
-        logger::log_global(
-            logger::LogLevel::Debug,
-            &format!("Request: method={:?}, id={}", method, req_id),
-        );
+        if logger::enabled(logger::LogLevel::Debug) {
+            logger::log_global(
+                logger::LogLevel::Debug,
+                &format!("Request: method={:?}, id={}", method, req_id),
+            );
+        }
 
         // Handler lookup & invocation
         let mut response = {
             let guard = handlers.read().await;
-            match guard.get(&method) {
+            match guard.get(method) {
                 Some(h) => h(&request),
                 None => {
                     logger::log_global(
                         logger::LogLevel::Warning,
                         &format!("Method not found: {:?}", method),
                     );
-                    YarResponse::error(req_id, 1, &YarError::MethodNotFound(method).to_string())
+                    YarResponse::error(
+                        req_id,
+                        SERVER_ERROR_STATUS,
+                        &YarError::MethodNotFound(method.to_string()).to_string(),
+                    )
                 }
             }
         };
@@ -634,17 +709,53 @@ where
 
         // Send response, bounded so a client that stops reading cannot pin
         // this task forever.
-        if let Err(e) =
-            send_response_with_timeout(stream, &response, extra_bytes, limits.write_timeout).await
-        {
-            logger::log_global(logger::LogLevel::Error, &format!("Send failed: {}", e));
-            return Ok(());
+        let bytes_sent =
+            match send_response_with_timeout(stream, &response, extra_bytes, limits.write_timeout)
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    logger::log_global(logger::LogLevel::Error, &format!("Send failed: {}", e));
+                    return Ok(());
+                }
+            };
+
+        // Access log: same shape as C yar_server_log (OKEY on success, ERROR
+        // on a non-zero status).
+        if limits.access_log {
+            let provider = escape_log_field(&provider_str(&header_provider));
+            let method_log = escape_log_field(method);
+            let elapsed_us = req_start.elapsed().as_micros();
+            if response.status == 0 {
+                logger::log_global(
+                    logger::LogLevel::Ok,
+                    &format!(
+                        "{} {} \"{}\" \"{}\" {} {}",
+                        req_id, peer, method_log, provider, bytes_sent, elapsed_us
+                    ),
+                );
+            } else {
+                logger::log_global(
+                    logger::LogLevel::Error,
+                    &format!(
+                        "{} {} \"{}\" {} \"{}\" {} -",
+                        req_id,
+                        peer,
+                        method_log,
+                        escape_log_field(response.error.as_deref().unwrap_or("")),
+                        provider,
+                        bytes_sent
+                    ),
+                );
+            }
         }
 
-        logger::log_global(
-            logger::LogLevel::Debug,
-            &format!("Response sent for id={}", req_id),
-        );
+        if logger::enabled(logger::LogLevel::Debug) {
+            logger::log_global(
+                logger::LogLevel::Debug,
+                &format!("Response sent for id={}", req_id),
+            );
+        }
 
         if !is_persistent {
             return Ok(());
@@ -718,6 +829,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             request_timeout: None,
+            access_log: false,
         }
     }
 
@@ -873,7 +985,9 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
+            let _ =
+                handle_connection_with_timeout(&mut stream, "test-peer", &handlers, test_limits())
+                    .await;
             let _ = stream.shutdown().await;
         });
 
@@ -927,7 +1041,9 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
+            let _ =
+                handle_connection_with_timeout(&mut stream, "test-peer", &handlers, test_limits())
+                    .await;
             let _ = stream.shutdown().await;
         });
 
@@ -980,7 +1096,9 @@ mod tests {
             let (stream, _peer) = listener.accept().await.unwrap();
             let mut stream = stream;
             let handlers = server.handlers.clone();
-            let _ = handle_connection_with_timeout(&mut stream, &handlers, test_limits()).await;
+            let _ =
+                handle_connection_with_timeout(&mut stream, "test-peer", &handlers, test_limits())
+                    .await;
             let _ = stream.shutdown().await;
         });
 

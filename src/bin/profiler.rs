@@ -1,7 +1,7 @@
 //! `profiler` — k6-style VU/body-matrix load generator CLI.
 //!
 //! Runs every (body size, VU) stage against a single Yar server for a
-//! fixed step time and writes one CSV line per stage (13 columns).
+//! fixed step time and writes one CSV line per stage (14 columns).
 //!
 //! Container/target orchestration (spinning up the server, resource
 //! limits, cgroup sampling) lives in `profile/run.sh` (Task 8): this CLI
@@ -10,8 +10,9 @@
 //! CLI (all options optional, defaults shown):
 //!   --host `<addr>`     target Yar server                     (default 127.0.0.1:9501)
 //!   --vus `<csv>`       VU ladder, bare numbers, comma-list    (default 10,20,40,80,160,320,640)
-//!   --sizes `<csv>`     body ladder, b/k/m suffix allowed      (default 256b,1k,4k,16k,64k,256k,512k,1m,2m,4m)
-//!   --step-time `<dur>` per-stage duration, s/ms suffix        (default 10s)
+//!   --sizes `<csv>`     body ladder, b/k/m suffix allowed      (default 0,256b,...,4m)
+//!   --step-time `<dur>` per-stage measured duration, s/ms      (default 10s)
+//!   --warmup `<dur>`    per-stage warmup before measuring      (default 2s)
 //!   --out `<path>`      CSV destination                        (default: stdout)
 
 use std::fs::File;
@@ -29,8 +30,9 @@ Usage: profiler [options]
 Options:
   --host <addr>      Target Yar server as host:port (default: 127.0.0.1:9501)
   --vus <csv>        Comma-separated VU ladder (default: 10,20,40,80,160,320,640)
-  --sizes <csv>      Comma-separated body ladder: b/k/m suffix (default: 256b,1k,...,4m)
-  --step-time <dur>  Per-stage duration: s/ms suffix (default: 10s)
+  --sizes <csv>      Comma-separated body ladder: b/k/m suffix (default: 0,256b,1k,...,4m)
+  --step-time <dur>  Per-stage measured duration: s/ms suffix (default: 10s)
+  --warmup <dur>     Per-stage warmup before measuring: s/ms suffix (default: 2s)
   --out <path>       Write CSV to this path instead of stdout";
 
 #[derive(Debug)]
@@ -39,6 +41,7 @@ struct Args {
     vus: Vec<usize>,
     sizes: Vec<usize>,
     step_time: Duration,
+    warmup: Duration,
     out: Option<String>,
 }
 
@@ -78,12 +81,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         vus: DEFAULT_VUS.to_vec(),
         sizes: DEFAULT_SIZES.to_vec(),
         step_time: parse_duration_suffix("10s").expect("valid default"),
+        warmup: parse_duration_suffix("2s").expect("valid default"),
         out: None,
     };
     let mut i = 0;
     while i < argv.len() {
         let (flag, value) = match argv[i].as_str() {
-            f @ ("--host" | "--vus" | "--sizes" | "--step-time" | "--out") => (
+            f @ ("--host" | "--vus" | "--sizes" | "--step-time" | "--warmup" | "--out") => (
                 f,
                 argv.get(i + 1)
                     .ok_or_else(|| format!("missing value for {f}"))?,
@@ -97,6 +101,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             ("--step-time", v) => {
                 args.step_time =
                     parse_duration_suffix(v).map_err(|e| format!("--step-time: {e}"))?;
+            }
+            ("--warmup", v) => {
+                args.warmup = parse_duration_suffix(v).map_err(|e| format!("--warmup: {e}"))?;
             }
             ("--out", v) => args.out = Some(v.clone()),
             _ => unreachable!("flag was matched in the use-list above"),
@@ -122,6 +129,7 @@ fn main() -> ExitCode {
         body_sizes: args.sizes,
         vus: args.vus,
         step_time: args.step_time,
+        warmup: args.warmup,
     };
 
     let reports = match run_profile(&cfg) {

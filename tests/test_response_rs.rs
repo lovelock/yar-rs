@@ -218,11 +218,11 @@ fn test_response_error_truncation() {
     resp.set_error(1, "short error");
     assert_eq!(resp.get_error(), Some("short error"));
 
-    // Message over 1024 bytes: truncated with "..." appended
+    // Message over 1024 bytes: C truncates to 1023 bytes (1020 + "...")
     let long_msg = "x".repeat(2000);
     resp.set_error(1, &long_msg);
     let err = resp.get_error().unwrap();
-    assert_eq!(err.len(), 1027); // 1024 bytes + "..."
+    assert_eq!(err.len(), 1023); // 1020 bytes + "..."
     assert!(err.ends_with("..."));
 }
 

@@ -86,7 +86,7 @@ map(i=1000, m="add", p=[10, 20])
 ```text
 {
   "i": <unsigned int>,    请求 ID（原样返回）
-  "s": <int>,             状态码：0 = 成功，非 0 = 错误
+  "s": <int>,             状态码：0 = 成功，非 0 = 错误；服务端生成的错误统一为 8（C 的 YAR_ERROR）
   "r": <any> 或 <null>,   返回值；出错时无
   "e": <string> 或 <null> 错误信息；成功时为 null
 }

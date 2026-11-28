@@ -27,7 +27,7 @@ impl LogLevel {
     /// Return the display string for the log level.
     fn as_str(&self) -> &'static str {
         match self {
-            LogLevel::Ok => "OK",
+            LogLevel::Ok => "OKEY",
             LogLevel::Debug => "DEBUG",
             LogLevel::Notice => "NOTICE",
             LogLevel::Warning => "WARNING",
@@ -202,6 +202,19 @@ pub fn set_hostname(hostname: &str) {
 /// Return a reference to the global logger, if initialised.
 pub fn global() -> Option<&'static YarLogger> {
     GLOBAL_LOGGER.get()
+}
+
+/// True when `level` would be emitted by the global logger.
+///
+/// Call this before building a formatted message on a hot path: `format!` at
+/// the call site allocates even when the logger would drop the line.
+pub fn enabled(level: LogLevel) -> bool {
+    match GLOBAL_LOGGER.get() {
+        Some(logger) => {
+            logger.is_enabled() && (level == LogLevel::Ok || level >= logger.min_level())
+        }
+        None => false,
+    }
 }
 
 /// Log a message through the global logger.

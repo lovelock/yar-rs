@@ -34,18 +34,22 @@ requests from Yar clients written in PHP, Java, C, or Rust — and vice versa.
   header (version 0, magic `0x80DFEC60`), followed by a packager name and a
   msgpack-encoded body.
 - **Client** (`YarClient`): blocking API with `connect()` / `call()` /
-  `close()`, persistent connections, connect/read/write timeouts, and
-  bounded response sizes.
+  `close()`, persistent connections, connect/read/write timeouts, a 1-second
+  default (as C), bounded response sizes, `tcp://` or `host:port`, and
+  `call_raw()` / `build_request_packet()` for pre-packed hot paths.
 - **Server** (`YarServer`): Tokio-based async server, register handlers by
   method name, bounded in-flight connections, idle and total request
-  deadlines, and TCP or Unix-domain sockets (Unix only).
+  deadlines, TCP or Unix-domain sockets (Unix only), `tcp://` hostnames, a
+  10 MiB request cap, and a per-request OKEY/ERROR access log (default on,
+  as C).
 - **Pack / Unpack** (`Packager`, `YarData`): msgpack based pack/unpack with
   the same data model as the C version (null, bool, long, ulong, double,
   string, array, map), with limits against malicious nesting and lengths.
 - **Request / Response**: exact binary format of `yar_request` /
-  `yar_response` (id, method, parameters / status, error, retval).
-- **Logger** (`YarLogger`): file logger with the same log levels as the C
-  version.
+  `yar_response` (id, method, parameters / status, error, retval);
+  server-generated errors use status 8 like C.
+- **Logger** (`YarLogger`): file/stderr/pipe logger with the same levels and
+  the `OKEY` access-log level as the C version.
 
 ## Install
 
@@ -140,12 +144,18 @@ responses.
 The benchmark that compares this implementation with the original C one lives
 in [`profile/`](https://github.com/lovelock/yar-rs/tree/main/profile) (not part
 of the published crate). It runs a k6-style matrix with one persistent
-connection per virtual user and reports QPS, ok/fail, p50/p95/p99/p99.9, CPU
-share and memory peak.
+connection per virtual user and reports attempt QPS, **successful QPS
+(`ok_qps`)**, ok/fail, p50/p95/p99/p99.9, server CPU share, memory peak and
+CFS throttling, plus the load generator's CPU share.
 
-See
-[profile/README.md](https://github.com/lovelock/yar-rs/blob/main/profile/README.md)
-for the matrix, resource parity rules, report columns and sample results.
+Both servers run the same 3-second idle timeout and with per-request access
+logging off by default (the C benchmark build gates its OKEY log behind an
+environment variable), so neither side pays log I/O the other avoids. Every
+stage connects all VUs and warms up before measuring, and the profiler builds
+the request packet once per stage (`call_raw`) instead of repacking it per
+call. See
+[`profile/README.md`](https://github.com/lovelock/yar-rs/blob/main/profile/README.md)
+for the parity rules, report columns and the measured matrix.
 
 ## License
 

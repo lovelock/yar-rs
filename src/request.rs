@@ -50,7 +50,10 @@ impl YarRequest {
     /// Matches C `yar_request_pack` which allocates `extra_bytes + payload`
     /// and writes the map into the trailing region.
     pub fn pack(&self, extra_bytes: usize) -> YarResult<Vec<u8>> {
-        let mut pk = Packager::start_map(3)?;
+        // Reserve the prefix in the same buffer; the msgpack body is written
+        // after it in place (C does the same with `extra_bytes + payload`).
+        let mut pk = Packager::with_prefix(extra_bytes);
+        pk.push_map(3)?;
 
         // Key "i" -> request id (ulong)
         pk.push_string(b"i")?;
@@ -70,11 +73,7 @@ impl YarRequest {
             pk.push_null()?;
         }
 
-        let payload = pk.into_bytes();
-
-        let mut output = vec![0u8; extra_bytes + payload.len()];
-        output[extra_bytes..].copy_from_slice(&payload);
-        Ok(output)
+        Ok(pk.into_bytes())
     }
 
     /// Deserializes a request from msgpack bytes, skipping `extra_bytes`
@@ -92,12 +91,17 @@ impl YarRequest {
 
         let msgpack_bytes = &data[extra_bytes..];
         let unpk = Unpackager::new(msgpack_bytes)?;
-        let root = unpk.data();
 
-        // The top-level must be a Map.
-        let map = root
-            .as_map()
-            .ok_or_else(|| YarError::Protocol("request payload is not a msgpack map".into()))?;
+        // Move values out of the parsed tree; a full-tree clone would copy the
+        // whole parameter body (the echo hot path).
+        let mut map = match unpk.into_data() {
+            YarData::Map(map) => map,
+            _ => {
+                return Err(YarError::Protocol(
+                    "request payload is not a msgpack map".into(),
+                ))
+            }
+        };
 
         if map.len() < 2 {
             return Err(YarError::Protocol(
@@ -109,7 +113,7 @@ impl YarRequest {
         let mut method: Option<String> = None;
         let mut params: Option<YarData> = None;
 
-        for (key, value) in map {
+        for (key, value) in map.drain(..) {
             match key.as_str() {
                 Some("i") => {
                     id = Some(value.as_ulong().ok_or_else(|| {
@@ -117,20 +121,20 @@ impl YarRequest {
                     })?);
                 }
                 Some("m") => {
-                    let bytes = value.as_bytes().ok_or_else(|| {
-                        YarError::Protocol("request 'm' field is not a string".into())
-                    })?;
-                    method = Some(
-                        std::str::from_utf8(bytes)
-                            .map_err(|e| {
-                                YarError::Protocol(format!("invalid UTF-8 in method: {}", e))
-                            })?
-                            .to_string(),
-                    );
+                    let bytes = match value {
+                        YarData::String(bytes) => bytes,
+                        _ => {
+                            return Err(YarError::Protocol(
+                                "request 'm' field is not a string".into(),
+                            ))
+                        }
+                    };
+                    method = Some(String::from_utf8(bytes).map_err(|e| {
+                        YarError::Protocol(format!("invalid UTF-8 in method: {}", e))
+                    })?);
                 }
                 Some("p") => {
-                    // Store the raw YarData reference (cloned) for later retrieval.
-                    params = Some(value.clone());
+                    params = Some(value);
                 }
                 _ => {
                     // Unknown keys are silently ignored, matching C behavior.

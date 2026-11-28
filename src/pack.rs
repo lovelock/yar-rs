@@ -175,6 +175,17 @@ impl Packager {
         Packager { buffer: Vec::new() }
     }
 
+    /// Creates a packager whose buffer starts with `prefix` zero bytes.
+    ///
+    /// `request.pack` / `response.pack` reserve the wire header and packager
+    /// name here and build the msgpack payload in the same buffer, avoiding a
+    /// second full-body copy.
+    pub(crate) fn with_prefix(prefix: usize) -> Self {
+        Packager {
+            buffer: vec![0u8; prefix],
+        }
+    }
+
     /// Creates a packager and writes an array header.
     pub fn start_array(size: u32) -> YarResult<Self> {
         let mut pk = Packager::new();

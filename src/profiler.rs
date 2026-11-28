@@ -10,6 +10,7 @@ use crate::client::YarClient;
 use crate::error::{YarError, YarResult};
 use crate::pack::Packager;
 use crate::response::YarResponse;
+use crate::PACKAGER_NAME;
 
 pub use crate::cli::{parse_duration_suffix, parse_size_suffix};
 
@@ -44,9 +45,9 @@ pub fn percentile(sorted: &[f64], pct: f64) -> f64 {
 /// `body_size` exceeds this value makes `run_profile` fail up front.
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 
-/// Default body-size ladder in bytes (256 B .. 4 M, ~4x steps).
-pub const DEFAULT_SIZES: [usize; 10] = [
-    256, 1_024, 4_096, 16_384, 65_536, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
+/// Default body-size ladder in bytes (0 = pure RPC overhead, then ~4x steps).
+pub const DEFAULT_SIZES: [usize; 11] = [
+    0, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
 ];
 
 /// Default VU (virtual user / concurrent connection) ladder.
@@ -66,6 +67,8 @@ pub struct ProfilerConfig {
     pub body_sizes: Vec<usize>,
     pub vus: Vec<usize>,
     pub step_time: Duration,
+    /// Per-stage warmup before the measured window starts (0 = none).
+    pub warmup: Duration,
 }
 
 /// Result of one stage: one (body_size, vus) cell of the matrix.
@@ -76,6 +79,8 @@ pub struct StageReport {
     pub duration_s: f64,
     /// Completed requests (ok + fail) per second.
     pub qps: f64,
+    /// Successful requests per second: the metric to compare between targets.
+    pub ok_qps: f64,
     pub ok: u64,
     pub fail: u64,
     /// Latency percentiles of the OK samples, in milliseconds.
@@ -85,9 +90,9 @@ pub struct StageReport {
     pub p999: f64,
     /// First failure text observed in the stage ("" when none).
     pub first_error: String,
-    /// Stage wall-clock window in epoch seconds (SystemTime).
-    pub start_ts: u64,
-    pub end_ts: u64,
+    /// Measured window in epoch seconds (fractional).
+    pub start_ts: f64,
+    pub end_ts: f64,
 }
 
 /// Run the full profiling matrix: every body size x every VU level, one
@@ -136,17 +141,42 @@ pub fn run_profile(cfg: &ProfilerConfig) -> YarResult<Vec<StageReport>> {
 }
 
 /// One stage: `vus` worker threads each holding their own persistent
-/// `YarClient` and hammering `echo` until the stage deadline.
+/// `YarClient`. All threads connect first (barrier), warm up for
+/// `cfg.warmup`, then run the measured window for `cfg.step_time`.
 fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport {
     let body = std::sync::Arc::new(make_body(body_size));
-    let deadline = std::time::Instant::now() + cfg.step_time;
-    let start_ts = epoch_secs();
+    let packet = match make_echo_packet(&body) {
+        Ok(p) => std::sync::Arc::new(p),
+        Err(e) => {
+            return ThreadOutcome {
+                ok: 0,
+                fail: vus as u64,
+                latencies_ms: Vec::new(),
+                first_error: Some(format!("pack failed: {}", e)),
+            }
+            .into_report(
+                body_size,
+                vus,
+                cfg.step_time,
+                epoch_secs_f64(),
+                epoch_secs_f64(),
+            );
+        }
+    };
+
+    // Every VU connects before any measurement starts, so the window is not
+    // polluted by a 640-thread connection ramp.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(vus + 1));
+    let warmup = cfg.warmup;
+    let step_time = cfg.step_time;
 
     let (tx, rx) = std::sync::mpsc::channel::<ThreadOutcome>();
     let mut handles = Vec::with_capacity(vus);
     for _ in 0..vus {
         let tx = tx.clone();
         let body = std::sync::Arc::clone(&body);
+        let packet = std::sync::Arc::clone(&packet);
+        let barrier = std::sync::Arc::clone(&barrier);
         let host = cfg.host.clone();
         handles.push(std::thread::spawn(move || {
             let mut client = match YarClient::connect(&host) {
@@ -160,6 +190,7 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
                         latencies_ms: Vec::new(),
                         first_error: Some(format!("connect failed: {}", e)),
                     });
+                    barrier.wait();
                     return;
                 }
             };
@@ -172,29 +203,41 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
                 latencies_ms: Vec::new(),
                 first_error: None,
             };
-            while std::time::Instant::now() < deadline {
-                // One echo parameter: the shared deterministic body.
-                let mut p = Packager::new();
-                if let Err(e) = p.push_string(&body) {
-                    outcome.note_failure(format!("pack failed: {}", e));
-                    continue;
+
+            // Release: all VUs are connected. Warm up, then measure.
+            let _ = barrier.wait();
+            let measure_start = std::time::Instant::now() + warmup;
+            let deadline = measure_start + step_time;
+
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
                 }
-                let t0 = std::time::Instant::now();
-                let result = client.call("echo", vec![p]);
+                let recorded = now >= measure_start;
+
+                let t0 = now;
+                // The request packet is built once per stage: no per-call
+                // repacking, no per-call body copy on the generator side.
+                let result: YarResult<YarResponse> = client
+                    .call_raw(&packet)
+                    .and_then(|raw| YarResponse::unpack(&raw, PACKAGER_NAME.len()));
                 let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
                 match validate_echo(&result, body_size, &body) {
                     Ok(()) => {
-                        outcome.ok += 1;
-                        outcome.latencies_ms.push(latency_ms);
+                        if recorded {
+                            outcome.ok += 1;
+                            outcome.latencies_ms.push(latency_ms);
+                        }
                     }
                     Err(msg) => {
-                        outcome.note_failure(msg);
-                        // A transport failure leaves the persistent socket
-                        // dead or out of sync. Reusing it would turn the rest
-                        // of the stage into a microsecond-fast failure loop
-                        // that inflates fail/qps and burns CPU; dial again,
-                        // as a k6 VU would. A content/status failure is a
-                        // server-side answer, so the connection stays.
+                        if recorded {
+                            outcome.note_failure(msg);
+                        }
+                        // A transport failure leaves the socket dead or out of
+                        // sync. Dial again, as a k6 VU would; a content/status
+                        // failure is a server-side answer, so keep the socket.
                         if result.is_err() {
                             match YarClient::connect(&host) {
                                 Ok(mut fresh) => {
@@ -203,7 +246,9 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
                                     client = fresh;
                                 }
                                 Err(e) => {
-                                    outcome.note_failure(format!("reconnect failed: {}", e));
+                                    if recorded {
+                                        outcome.note_failure(format!("reconnect failed: {}", e));
+                                    }
                                     break;
                                 }
                             }
@@ -215,6 +260,14 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
         }));
     }
     drop(tx);
+
+    // All VUs are connected and warmed up together; sleep through the warmup
+    // only to timestamp the measured window accurately for cgroup merging.
+    let _ = barrier.wait();
+    if !warmup.is_zero() {
+        std::thread::sleep(warmup);
+    }
+    let start_ts = epoch_secs_f64();
 
     // Aggregate worker outcomes as they arrive.
     let mut agg = ThreadOutcome {
@@ -236,9 +289,18 @@ fn run_stage(cfg: &ProfilerConfig, body_size: usize, vus: usize) -> StageReport 
     for h in handles {
         let _ = h.join();
     }
-    let end_ts = epoch_secs();
+    let end_ts = epoch_secs_f64();
 
     agg.into_report(body_size, vus, cfg.step_time, start_ts, end_ts)
+}
+
+/// Build the reusable echo request packet: one parameter, the shared body.
+fn make_echo_packet(body: &[u8]) -> YarResult<Vec<u8>> {
+    let mut param = Packager::new();
+    param.push_string(body)?;
+    let mut arr = Packager::start_array(1)?;
+    arr.push_packager(&param)?;
+    crate::client::build_request_packet("echo", Some(arr), true)
 }
 
 /// What one VU thread observed over its stage.
@@ -264,8 +326,8 @@ impl ThreadOutcome {
         body_size: usize,
         vus: usize,
         step_time: Duration,
-        start_ts: u64,
-        end_ts: u64,
+        start_ts: f64,
+        end_ts: f64,
     ) -> StageReport {
         let mut latencies = self.latencies_ms;
         latencies.sort_by(f64::total_cmp);
@@ -276,6 +338,11 @@ impl ThreadOutcome {
             duration_s,
             qps: if duration_s > 0.0 {
                 (self.ok + self.fail) as f64 / duration_s
+            } else {
+                0.0
+            },
+            ok_qps: if duration_s > 0.0 {
+                self.ok as f64 / duration_s
             } else {
                 0.0
             },
@@ -359,18 +426,18 @@ fn make_body(body_size: usize) -> Vec<u8> {
     (0..body_size).map(|i| (i % 251) as u8).collect()
 }
 
-/// Current time in epoch seconds (0 if the clock is before the epoch).
-fn epoch_secs() -> u64 {
+/// Current time in epoch seconds with sub-second precision (0 before the epoch).
+fn epoch_secs_f64() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 // -- CSV rendering ------------------------------------------------------------
 
-/// CSV header: fixed 13-column contract shared with Task 8 run.sh.
-pub const CSV_HEADER: &str = "size_bytes,vus,duration_s,qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts";
+/// CSV header: fixed 14-column contract shared with Task 8 run.sh.
+pub const CSV_HEADER: &str = "size_bytes,vus,duration_s,qps,ok_qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts";
 
 /// Quote a CSV field when it contains comma, double-quote, CR or LF,
 /// doubling any embedded double quotes.
@@ -389,11 +456,12 @@ pub fn write_csv(reports: &[StageReport], out: &mut dyn std::io::Write) -> std::
     for r in reports {
         writeln!(
             out,
-            "{},{},{:.3},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{},{},{}",
+            "{},{},{:.3},{:.2},{:.2},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3}",
             r.body_size,
             r.vus,
             r.duration_s,
             r.qps,
+            r.ok_qps,
             r.ok,
             r.fail,
             r.p50,

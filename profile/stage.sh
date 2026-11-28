@@ -42,4 +42,20 @@ cp -a "$yar_c_src" "$stage/yar-c"
 cp "$script_dir/yar_echo_server.c" "$stage/"
 cp "$script_dir/yar-entrypoint.sh" "$stage/"
 
+# Benchmark-only change, applied to the STAGED copy (../yar-c is never edited):
+# C emits one access-log line per request at OKEY and flushes it, while the
+# Rust server has no access log. Gate that one call behind an env var so both
+# servers run with access logging off by default; `run.sh --access-log` sets
+# YAR_BENCH_ACCESS_LOG=1 to measure the logging cost separately.
+if ! command -v perl >/dev/null 2>&1; then
+	echo "stage.sh: perl is required to apply the benchmark access-log gate" >&2
+	exit 1
+fi
+perl -0pi -e 's/\byar_server_log\(ctx\);/if (getenv("YAR_BENCH_ACCESS_LOG")) yar_server_log(ctx);/' \
+	"$stage/yar-c/yar_server.c"
+if ! grep -q 'YAR_BENCH_ACCESS_LOG' "$stage/yar-c/yar_server.c"; then
+	echo "stage.sh: failed to apply the benchmark access-log gate" >&2
+	exit 1
+fi
+
 printf '%s\n' "$stage"

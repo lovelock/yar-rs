@@ -42,6 +42,7 @@ async fn main() {
 |---|---|
 | `host:port` | TCP 监听，例如 `127.0.0.1:9501`、`0.0.0.0:9501`。**必须包含端口号** |
 | `/path/to.sock` | Unix domain socket（仅 Unix 平台；Windows 上返回错误）。socket 文件由 `run()` 创建 |
+| `tcp://host:port` | 同上，接受 C 风格的 `tcp://` 前缀 |
 | `http://…` / `https://…` | 直接报错。Yar 使用原始 TCP 协议，不支持 HTTP 传输 |
 
 ## 注册 handler：`register_handler`
@@ -155,8 +156,8 @@ server
     .await;
 ```
 
-- 错误信息超长（> 1024 字节）会被截断并追加 `"..."`（与 C 一致）。
-- 未注册的方法被调用时，服务端会自动返回 status != 0、内容为
+- 错误信息超长（>= 1024 字节）会被截断为 1023 字节（1020 + `"..."`，与 C 一致）。
+- 未注册的方法被调用时，服务端会自动返回 **status 8**（C 的 `YAR_ERROR`）、内容为
   `"Method not found: xxx"` 的错误响应。
 
 ## 运行选项
@@ -169,6 +170,8 @@ server
 | `set_write_timeout(Duration)` | 5 秒 | 写响应的超时；客户端停止读取时不会永久占用任务 |
 | `set_request_timeout(Option<Duration>)` | 30 秒 | 接收一个完整请求（头 + body）的总时限；`None` 关闭 |
 | `set_log_file(path)` | None | 日志文件路径；未设置时输出 stderr |
+| `set_log_level(LogLevel)` | Notice | 日志级别；`Ok`（OKEY）级始终输出 |
+| `set_access_log(bool)` | `true` | 每请求写一条 OKEY/ERROR 访问日志（与 C 一致）；压测可关闭 |
 | `set_pid_file(path)` | None | 启动时把当前进程 PID 写入该文件 |
 
 ## 连接生命周期与并发模型
@@ -179,7 +182,8 @@ server
   持续处理新请求，直到任意读超时/对端断开，或收到非持久请求（响应后关闭）。
 - 客户端在不同连接之间天然并行；同一连接上的调用串行。
 
-> 服务端响应头的 provider/token 字段为全零，`reserved` 为 0（非持久响应）。
+> 服务端响应头的 provider 字段为 `"Yar Rust Server <版本>"`（与 C 写
+> `YAR_SERVER_NAME` 一致），token 全零，`reserved` 为 0。
 
 ## 关闭服务
 
