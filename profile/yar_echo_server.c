@@ -12,6 +12,7 @@
  *   -X          standalone: do not fork, -n is ignored (1 worker)
  *   -l <file>   log file (optional)
  *   -p <file>   pid file (optional)
+ *   -t <sec>    per-request read timeout, default 3 (matches C's YAR_READ_TIMEOUT)
  *   -h          usage
  */
 
@@ -54,11 +55,11 @@ static yar_server_handler echo_handlers[] = {
 };
 
 int main(int argc, char **argv) {
-	int opt, max_childs = 2;
+	int opt, max_childs = 2, read_timeout = 3;
 	char *hostname = NULL, *yar_pid = NULL, *log_file = NULL;
 	int standalone = 0;
 
-	while ((opt = getopt(argc, argv, "hS:n:p:Xl:")) != -1) {
+	while ((opt = getopt(argc, argv, "hS:n:p:Xl:t:")) != -1) {
 		switch (opt) {
 			case 'n':
 				max_childs = atoi(optarg);
@@ -74,6 +75,9 @@ int main(int argc, char **argv) {
 				break;
 			case 'l':
 				log_file = optarg;
+				break;
+			case 't':
+				read_timeout = atoi(optarg);
 				break;
 			default:
 				yar_server_print_usage(argv[0]);
@@ -91,6 +95,7 @@ int main(int argc, char **argv) {
 		yar_server_set_opt(YAR_MAX_CHILDREN, &max_childs);
 		yar_server_set_opt(YAR_PID_FILE, yar_pid);
 		yar_server_set_opt(YAR_LOG_FILE, log_file);
+		yar_server_set_opt(YAR_READ_TIMEOUT, &read_timeout);
 		yar_server_register_handler(echo_handlers);
 		yar_server_run();
 	}

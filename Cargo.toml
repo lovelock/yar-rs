@@ -2,21 +2,48 @@
 name = "yar-rs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Rust implementation of the Yar RPC framework"
 license = "Apache-2.0"
+repository = "https://github.com/lovelock/yar-rs"
+homepage = "https://github.com/lovelock/yar-rs"
+documentation = "https://docs.rs/yar-rs"
+readme = "README.md"
+authors = [
+    "lovelock <happyhackerwqc@foxmail.com>",
+    "Xinchen Hui <laruence@gmail.com>",
+]
+keywords = ["rpc", "yar", "msgpack", "php", "async"]
+categories = ["network-programming", "api-bindings"]
+exclude = [
+    "/.dockerignore",
+    "/.gitignore",
+    "/docs/superpowers",
+    "/profile",
+    "/results",
+]
+
+[features]
+default = []
+# Benchmark/load-generation tooling; not part of the RPC API.
+profiler = []
 
 [dependencies]
 # msgpack serialization
 rmp = "0.8"
-rmp-serde = "1.1"
-serde = { version = "1.0", features = ["derive"] }
 
 # async runtime for server
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+    "macros",
+] }
 
 # logging
-log = "0.4"
-env_logger = "0.11"
 chrono = "0.4"
 
 # byte order handling
@@ -25,5 +52,7 @@ byteorder = "1.5"
 # error handling
 thiserror = "2"
 
-[dev-dependencies]
-tokio-test = "0.4"
+[[bin]]
+name = "profiler"
+path = "src/bin/profiler.rs"
+required-features = ["profiler"]

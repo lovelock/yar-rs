@@ -1,10 +1,11 @@
 # yar-rs 用户指南
 
-本目录是 [yar-rs](https://github.com/laruence/yar-rs) —— [Yar RPC 框架](https://github.com/laruence/yar) 的 Rust 实现 —— 的完整用户指南。
+本目录是 [yar-rs](https://github.com/lovelock/yar-rs) —— [Yar RPC 框架](https://github.com/laruence/yar) 的 Rust 实现 —— 的完整用户指南。
 
-> **所有 doc 示例均经过编译与运行校验**：每个文档片段都对应
-> [`tests/doc_examples.rs`](../tests/doc_examples.rs) 中的一个测试，
-> 由 `cargo test` 保持同步。如果你要修改本文档中的示例，请同步修改对应测试。
+> **可编译的示例都在测试中校验**：标记为 `rust` 且可独立运行的片段对应
+> [`tests/doc_examples.rs`](../tests/doc_examples.rs) 中的测试；纯片段用
+> `text` 标记，说明性代码不保证可独立编译。如果你要修改文档中的示例，请同步
+> 修改对应测试。
 
 ## 指南目录
 

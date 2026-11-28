@@ -1,0 +1,12 @@
+yar-rs
+Copyright 2026 the yar-rs contributors
+
+This product includes a Rust implementation of the Yar RPC wire protocol
+and data model. The protocol was originally implemented in C by Xinchen
+Hui and contributors in the Yar project (https://github.com/laruence/yar).
+
+The C sources that were present in this repository's earlier history are
+retained in the git history for provenance. The current crate contains
+only the Rust implementation and its documentation.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.

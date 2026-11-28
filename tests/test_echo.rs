@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use yar_rs::*;
 use yar_rs::client::YarClient;
+use yar_rs::*;
 
 /// RAII guard: kills and reaps the child on drop, including on panics,
 /// so a failing assertion never leaves the server process behind.
@@ -87,7 +87,7 @@ fn build_header(id: u32, body_len: u32, persistent: bool) -> Vec<u8> {
     BigEndian::write_u32(&mut header_bytes[6..10], PROTOCOL_MAGIC); // magic
     let reserved = if persistent { PROTOCOL_PERSISTENT } else { 0 };
     BigEndian::write_u32(&mut header_bytes[10..14], reserved); // reserved
-    // provider[14..46] and token[46..78] stay zeroed
+                                                               // provider[14..46] and token[46..78] stay zeroed
     BigEndian::write_u32(&mut header_bytes[78..82], body_len); // body_len
     header_bytes
 }
@@ -159,7 +159,10 @@ fn test_binary_echo_and_oversized_rejection() {
     // -- Case (b): pre-body rejection of an oversized request ------------
     // Declare 1 MiB + 16 bytes while the server allows 1m = 1_048_576.
     let mut stream = TcpStream::connect(&addr).unwrap_or_else(|e| {
-        panic!("oversized-request test failed to reconnect to {}: {}", addr, e)
+        panic!(
+            "oversized-request test failed to reconnect to {}: {}",
+            addr, e
+        )
     });
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))

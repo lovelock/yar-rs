@@ -11,10 +11,10 @@ use std::time::Duration;
 use yar_rs::{Packager, YarClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 连接地址：必须 "host:port"；以 "/" 开头视为 Unix domain socket
+    // 连接地址：必须 "host:port"（或 "tcp://host:port"）；以 "/" 开头视为 Unix domain socket
     let mut client = YarClient::connect("127.0.0.1:9501")?;
 
-    // 可选配置：超时（默认 5 秒）/ 持久连接（默认 false）
+    // 可选配置：超时（默认 1 秒，与 C 一致）/ 持久连接（默认 false）
     client.set_timeout(Duration::from_secs(5));
     client.set_persistent(true);
 
@@ -42,18 +42,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 传入格式 | 行为 |
 |---|---|
 | `host:port` | TCP 连接（**必须带端口号**，如 `127.0.0.1:9501`） |
-| `/path/to.sock` | Unix domain socket（客户端支持，服务端暂不支持） |
+| `tcp://host:port` | 同上，接受 C 风格的前缀 |
+| `/path/to.sock` | Unix domain socket（仅 Unix 平台；Windows 上返回错误） |
 | `localhost`（无端口） | 返回 `Connection("hostname must include port")` |
 | `http://…` / `https://…` | 返回 `Connection("HTTP/HTTPS not supported ...")` |
 
 失败会立即返回 `YarError::Connection`/`YarError::Io`（找不到主机、拒绝连接等）。
 
+## 热路径：预打包请求
+
+每次 `call(method, params)` 都会重新拼装参数数组、请求 envelope 和协议头。
+如果同一个请求要发送很多次（压测、批处理），可以先构造一次完整 wire packet，
+再用 `call_raw` 复用：
+
+- `yar_rs::client::build_request_packet(method, Option<Packager>, persistent) -> YarResult<Vec<u8>>`
+  返回 `[82 字节头][MSGPACK\0][msgpack 请求]`；
+- `client.call_raw(&packet) -> YarResult<Vec<u8>>` 发送该 packet，返回原始响应体
+  （8 字节 packager 名 + msgpack），可用 `YarResponse::unpack(&body, 8)` 解析。
+
+参数含义与 `call` 相同：`params` 是请求的 `p` 值（服务端通常按数组约定读取）。
+`call_raw` 同样遵守失败后连接不可复用的语义和响应体上限。
+
 ## 超时与持久连接
 
 ```rust
-client.set_timeout(Duration::from_secs(3)); // 读/写超时，默认 5 秒
+client.set_timeout(Duration::from_secs(3)); // 读/写超时，默认 1 秒（与 C 一致）
+client.set_max_response_size(10 * 1024 * 1024); // 响应体上限，默认 10 MiB
 client.set_persistent(true);                // 见下文
 ```
+
+如果需要限制建立连接的时间，使用
+`YarClient::connect_with_timeout(host, Duration)`；默认建连超时为 1 秒，同时
+覆盖主机名解析（解析在辅助线程上执行，超时后返回错误）和 TCP connect。
 
 ### ⚠️ 重要的生命周期语义（与原 C 客户端一致）
 
@@ -115,7 +135,8 @@ resp.get_response() -> Option<&YarData>  # 返回值 r 字段；出错时为 Non
 resp.get_error()    -> Option<&str>  # 错误信息 e 字段；成功时为 None（含客户端未注册方法等）
 ```
 
-客户端收到的响应解析必然成功或抛出传输类错误（连接断开/超时/非法魔数）；
+客户端会校验响应大小、packager 名与响应 id；失败时返回传输/协议类 `Err`
+（连接断开、超时、非法魔数、响应过大、id 不匹配等）。
 **业务失败永远体现在 `status`/`error` 上，而不是 `Err`**。
 
 ## 错误处理
@@ -140,7 +161,7 @@ match YarClient::connect("http://example.com:8080") {
 `YarClient::call` 是**阻塞 IO**（与 C 客户端一致的同步 API）。
 在 Tokio 异步函数里请勿直接调用（会阻塞工作线程），应使用 `spawn_blocking`：
 
-```rust
+```text
 // tokio::task::spawn_blocking
 let client = YarClient::connect("127.0.0.1:9501")?;
 let resp = tokio::task::spawn_blocking(move || {

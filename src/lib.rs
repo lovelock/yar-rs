@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 //! Yar RPC framework - Rust implementation
 //!
 //! 与原 Yar C 实现线上协议完全兼容的 RPC 框架。
@@ -6,7 +8,7 @@
 //! # 三个典型入口
 //!
 //! - 服务端：[`YarServer::new`] + [`YarServer::register_handler`] + [`YarServer::run`]（Tokio 异步）
-//! - 客户端：[`YarClient::connect`] + [`YarClient::call`]（同步阻塞，持久连接）
+//! - 客户端：[`YarClient::connect`] + [`YarClient::call`]（同步阻塞，可选持久连接）
 //! - 打包：[`Packager`]（增量打包） / [`Unpackager`]（解析为 [`YarData`] 树）
 //!
 //! # 打包/解析往返示例
@@ -62,24 +64,35 @@
 //! assert_eq!(resp.get_status(), 0);
 //! ```
 
-pub mod protocol;
+#[doc(hidden)]
+pub mod cli;
+pub mod client;
+pub mod error;
+pub mod logger;
 pub mod pack;
+#[cfg(feature = "profiler")]
+pub mod profiler;
+pub mod protocol;
 pub mod request;
 pub mod response;
-pub mod logger;
-pub mod client;
 pub mod server;
-pub mod error;
-pub mod profiler;
 
-pub use protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING, PROTOCOL_LIST};
+pub use client::{YarClient, DEFAULT_MAX_RESPONSE_SIZE};
+pub use error::{YarError, YarResult};
 pub use pack::{Packager, Unpackager, YarData, YarDataType};
+pub use protocol::{
+    YarHeader, HEADER_SIZE, PROTOCOL_LIST, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT, PROTOCOL_PING,
+};
 pub use request::YarRequest;
 pub use response::YarResponse;
-pub use client::YarClient;
-pub use server::YarServer;
-pub use error::{YarError, YarResult};
+pub use server::{
+    YarServer, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_SIZE, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT,
+};
 
-pub const VERSION: &str = "0.1.0";
+/// Crate version, taken from `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Packager name embedded in every Yar packet.
 pub const PACKAGER_NAME: &[u8; 8] = b"MSGPACK\0";
+/// Packager name without the trailing NUL.
 pub const PACKAGER_NAME_STR: &str = "MSGPACK";

@@ -29,7 +29,9 @@ fn wait_for_port(port: u16) {
 /// Returns the JoinHandle for cleanup.
 fn start_server(
     port: u16,
-    setup: impl FnOnce(&YarServer) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> + Send + 'static,
+    setup: impl FnOnce(&YarServer) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>
+        + Send
+        + 'static,
 ) -> std::thread::JoinHandle<()> {
     let addr = format!("127.0.0.1:{}", port);
     std::thread::spawn(move || {
@@ -53,12 +55,14 @@ fn test_integration_echo() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("echo", |req| {
-                // Echo back the method name as a string
-                let mut pk = Packager::new();
-                pk.push_string(b"echo:ok").unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+            server
+                .register_handler("echo", |req| {
+                    // Echo back the method name as a string
+                    let mut pk = Packager::new();
+                    pk.push_string(b"echo:ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -87,15 +91,17 @@ fn test_integration_add() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("add", |req| {
-                let params = req.get_parameters();
-                let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
-                let sum: i64 = arr.iter().filter_map(|v| v.as_integer()).sum();
+            server
+                .register_handler("add", |req| {
+                    let params = req.get_parameters();
+                    let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
+                    let sum: i64 = arr.iter().filter_map(|v| v.as_integer()).sum();
 
-                let mut pk = Packager::new();
-                pk.push_long(sum).unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+                    let mut pk = Packager::new();
+                    pk.push_long(sum).unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -129,9 +135,11 @@ fn test_integration_error_handler() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("error", |_req| {
-                YarResponse::error(0, 42, "intentional error")
-            }).await;
+            server
+                .register_handler("error", |req| {
+                    YarResponse::error(req.id(), 42, "intentional error")
+                })
+                .await;
         })
     });
 
@@ -191,11 +199,13 @@ fn test_integration_persistent_connection() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("counter", |_req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"counted").unwrap();
-                YarResponse::success(0, pk)
-            }).await;
+            server
+                .register_handler("counter", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"counted").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -233,27 +243,33 @@ fn test_integration_multiple_handlers() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("hello", |_req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"world").unwrap();
-                YarResponse::success(0, pk)
-            }).await;
+            server
+                .register_handler("hello", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"world").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
 
-            server.register_handler("ping", |_req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"pong").unwrap();
-                YarResponse::success(0, pk)
-            }).await;
+            server
+                .register_handler("ping", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"pong").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
 
-            server.register_handler("double", |req| {
-                let params = req.get_parameters();
-                let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
-                let val = arr.first().and_then(|v| v.as_integer()).unwrap_or(0);
+            server
+                .register_handler("double", |req| {
+                    let params = req.get_parameters();
+                    let arr = params.and_then(|p| p.as_array()).unwrap_or(&[]);
+                    let val = arr.first().and_then(|v| v.as_integer()).unwrap_or(0);
 
-                let mut pk = Packager::new();
-                pk.push_long(val * 2).unwrap();
-                YarResponse::success(req.id(), pk)
-            }).await;
+                    let mut pk = Packager::new();
+                    pk.push_long(val * 2).unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -291,21 +307,23 @@ fn test_integration_complex_retval() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("complex", |_req| {
-                // Return: {"status": "ok", "items": [1, 2, 3]}
-                let mut inner_arr = Packager::start_array(3).unwrap();
-                inner_arr.push_long(1).unwrap();
-                inner_arr.push_long(2).unwrap();
-                inner_arr.push_long(3).unwrap();
+            server
+                .register_handler("complex", |req| {
+                    // Return: {"status": "ok", "items": [1, 2, 3]}
+                    let mut inner_arr = Packager::start_array(3).unwrap();
+                    inner_arr.push_long(1).unwrap();
+                    inner_arr.push_long(2).unwrap();
+                    inner_arr.push_long(3).unwrap();
 
-                let mut retval = Packager::start_map(2).unwrap();
-                retval.push_string(b"status").unwrap();
-                retval.push_string(b"ok").unwrap();
-                retval.push_string(b"items").unwrap();
-                retval.push_packager(&inner_arr).unwrap();
+                    let mut retval = Packager::start_map(2).unwrap();
+                    retval.push_string(b"status").unwrap();
+                    retval.push_string(b"ok").unwrap();
+                    retval.push_string(b"items").unwrap();
+                    retval.push_packager(&inner_arr).unwrap();
 
-                YarResponse::success(0, retval)
-            }).await;
+                    YarResponse::success(req.id(), retval)
+                })
+                .await;
         })
     });
 
@@ -373,11 +391,13 @@ fn test_integration_non_persistent_multiple_connections() {
 
     let _server_thread = start_server(port, |server| {
         Box::pin(async move {
-            server.register_handler("test", |_req| {
-                let mut pk = Packager::new();
-                pk.push_string(b"ok").unwrap();
-                YarResponse::success(0, pk)
-            }).await;
+            server
+                .register_handler("test", |req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"ok").unwrap();
+                    YarResponse::success(req.id(), pk)
+                })
+                .await;
         })
     });
 
@@ -399,4 +419,36 @@ fn test_integration_non_persistent_multiple_connections() {
         let resp = client.call("test", vec![]).unwrap();
         assert_eq!(resp.get_status(), 0);
     }
+}
+
+#[test]
+fn test_server_echoes_the_request_id() {
+    let port = find_available_port();
+    let addr = format!("127.0.0.1:{}", port);
+
+    let _server_thread = start_server(port, |server| {
+        Box::pin(async move {
+            // Deliberately return id 0: the server must overwrite it with the
+            // request id, exactly as the C server does.
+            server
+                .register_handler("legacy", |_req| {
+                    let mut pk = Packager::new();
+                    pk.push_string(b"ok").unwrap();
+                    YarResponse::success(0, pk)
+                })
+                .await;
+        })
+    });
+
+    wait_for_port(port);
+
+    let mut client = YarClient::connect(&addr).unwrap();
+    client.set_timeout(Duration::from_secs(5));
+
+    let resp = client.call("legacy", vec![]).unwrap();
+    assert_eq!(resp.get_status(), 0);
+    assert_eq!(resp.id, 1000);
+    assert_eq!(resp.get_response().unwrap().as_str(), Some("ok"));
+
+    client.close();
 }

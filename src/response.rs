@@ -49,17 +49,20 @@ impl YarResponse {
     }
 
     /// Sets error with status code and message.
-    /// Truncates message at 1024 bytes, appending "..." if truncated.
+    ///
+    /// Matches C `yar_response_set_error`: a message that does not fit is cut
+    /// to 1023 bytes total — 1020 bytes of payload plus `"..."`.
     pub fn set_error(&mut self, code: i64, message: &str) {
         self.status = code;
         let bytes = message.as_bytes();
-        if bytes.len() > 1024 {
-            // Truncate at 1024 bytes, being careful with UTF-8 boundaries
-            let truncated = std::str::from_utf8(&bytes[..1024])
-                .unwrap_or_else(|e| {
-                    // If we land mid-char, back up to valid boundary
-                    std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or("")
-                });
+        if bytes.len() >= 1024 {
+            // C: memcpy(buf + sizeof(buf) - sizeof("..."), "...", 3) and
+            // len = sizeof(buf) - 1.
+            let max = 1024 - 4;
+            let truncated = std::str::from_utf8(&bytes[..max]).unwrap_or_else(|e| {
+                // If we land mid-char, back up to valid boundary
+                std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or("")
+            });
             self.error = Some(format!("{}...", truncated));
         } else {
             self.error = Some(message.to_string());
@@ -73,7 +76,10 @@ impl YarResponse {
 
     /// Serializes the response to msgpack bytes with extra_bytes prepended.
     pub fn pack(&self, extra_bytes: usize) -> YarResult<Vec<u8>> {
-        let mut pk = Packager::start_map(4)?;
+        // Build the envelope after a zeroed prefix in one buffer; the caller
+        // overwrites the prefix with the wire header (one body copy).
+        let mut pk = Packager::with_prefix(extra_bytes);
+        pk.push_map(4)?;
 
         // "i" -> id (ulong)
         pk.push_string(b"i")?;
@@ -83,10 +89,12 @@ impl YarResponse {
         pk.push_string(b"s")?;
         pk.push_long(self.status)?;
 
-        // "r" -> retval or null
+        // "r" -> retval, retval data, or null
         pk.push_string(b"r")?;
         if let Some(ref packed) = self.retval_packed {
             pk.push_packager(packed)?;
+        } else if let Some(ref data) = self.retval {
+            pk.push_data(data)?;
         } else {
             pk.push_null()?;
         }
@@ -99,10 +107,7 @@ impl YarResponse {
             pk.push_null()?;
         }
 
-        let msgpack_bytes = pk.into_bytes();
-        let mut result = vec![0u8; extra_bytes];
-        result.extend_from_slice(&msgpack_bytes);
-        Ok(result)
+        Ok(pk.into_bytes())
     }
 
     /// Deserializes a response from msgpack bytes, skipping extra_bytes at the start.
@@ -112,46 +117,54 @@ impl YarResponse {
         }
         let payload = &data[extra_bytes..];
         let unpk = Unpackager::new(payload)?;
-        let root = unpk.data();
 
-        let map = root.as_map().ok_or_else(|| {
-            YarError::Protocol("response root is not a map".into())
-        })?;
+        let mut map = match unpk.into_data() {
+            YarData::Map(map) => map,
+            _ => return Err(YarError::Protocol("response root is not a map".into())),
+        };
 
-        let mut id: u64 = 0;
-        let mut status: i64 = 0;
+        let mut id: Option<u64> = None;
+        let mut status: Option<i64> = None;
         let mut error: Option<String> = None;
         let mut retval: Option<YarData> = None;
 
-        for (key, val) in map {
+        for (key, val) in map.drain(..) {
             match key.as_bytes() {
                 Some(b"i") => {
-                    id = val.as_ulong().ok_or_else(|| {
-                        YarError::Protocol("response 'i' is not ulong".into())
-                    })?;
+                    id =
+                        Some(val.as_ulong().ok_or_else(|| {
+                            YarError::Protocol("response 'i' is not ulong".into())
+                        })?);
                 }
                 Some(b"s") => {
-                    // C code checks for YAR_DATA_ULONG but we handle both Long and Ulong
-                    status = val.as_integer().ok_or_else(|| {
-                        YarError::Protocol("response 's' is not an integer".into())
-                    })?;
+                    // C code checks for YAR_DATA_ULONG but we handle both Long and Ulong.
+                    // Ulong values above i64::MAX are rejected rather than wrapped.
+                    status = Some(val.as_integer().ok_or_else(|| {
+                        YarError::Protocol("response 's' is not an in-range integer".into())
+                    })?);
                 }
                 Some(b"r") => {
                     if val.data_type() != crate::pack::YarDataType::Null {
-                        retval = Some(val.clone());
+                        retval = Some(val);
                     }
                 }
-                Some(b"e") => {
-                    if val.data_type() != crate::pack::YarDataType::Null {
-                        let err_str = val.as_str().ok_or_else(|| {
-                            YarError::Protocol("response 'e' is not a string".into())
-                        })?;
-                        error = Some(err_str.to_string());
-                    }
+                Some(b"e") if val.data_type() != crate::pack::YarDataType::Null => {
+                    // C copies the raw bytes; accept any bytes and use a
+                    // lossy conversion so one bad error string does not
+                    // invalidate the whole response.
+                    let bytes = match val {
+                        YarData::String(bytes) => bytes,
+                        _ => return Err(YarError::Protocol("response 'e' is not a string".into())),
+                    };
+                    error = Some(String::from_utf8_lossy(&bytes).into_owned());
                 }
                 _ => {} // ignore unknown keys
             }
         }
+
+        let id = id.ok_or_else(|| YarError::Protocol("response missing 'i' field".into()))?;
+        let status =
+            status.ok_or_else(|| YarError::Protocol("response missing 's' field".into()))?;
 
         Ok(YarResponse {
             id,
@@ -224,8 +237,8 @@ mod tests {
         let long_msg = "x".repeat(2000);
         resp.set_error(1, &long_msg);
         let err = resp.get_error().unwrap();
-        // 1024 bytes of 'x' + "..." = 1027
-        assert_eq!(err.len(), 1027);
+        // 1020 bytes of 'x' + "..." = 1023, matching C's 1024-byte buffer.
+        assert_eq!(err.len(), 1023);
         assert!(err.ends_with("..."));
     }
 
@@ -284,11 +297,11 @@ mod tests {
         // "r" = fixstr(1) 0xa1 + 'r', value = nil 0xc0
         // "e" = fixstr(1) 0xa1 + 'e', value = nil 0xc0
         let expected: Vec<u8> = vec![
-            0x84,                   // fixmap(4)
-            0xa1, b'i', 0x01,       // "i" -> 1
-            0xa1, b's', 0x00,       // "s" -> 0
-            0xa1, b'r', 0xc0,       // "r" -> nil
-            0xa1, b'e', 0xc0,       // "e" -> nil
+            0x84, // fixmap(4)
+            0xa1, b'i', 0x01, // "i" -> 1
+            0xa1, b's', 0x00, // "s" -> 0
+            0xa1, b'r', 0xc0, // "r" -> nil
+            0xa1, b'e', 0xc0, // "e" -> nil
         ];
         assert_eq!(packed, expected);
     }

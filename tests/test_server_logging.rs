@@ -60,7 +60,8 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
     });
 
     assert!(
-        wait_until(Duration::from_secs(5), || read_log(&log_path).contains("Listening on")),
+        wait_until(Duration::from_secs(5), || read_log(&log_path)
+            .contains("Listening on")),
         "server never logged readiness:\n{}",
         read_log(&log_path)
     );
@@ -78,12 +79,7 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
     //    still a truncated request even though zero body bytes arrived.
     let mut header = yar_rs::protocol::YarHeader::new();
     header.render(1, None, None, 1024, 0);
-    let header_bytes: [u8; yar_rs::protocol::HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(
-            &header as *const yar_rs::protocol::YarHeader
-                as *const [u8; yar_rs::protocol::HEADER_SIZE],
-        )
-    };
+    let header_bytes = header.to_bytes();
     let mut no_body = std::net::TcpStream::connect(&addr).unwrap();
     no_body.write_all(&header_bytes).unwrap();
     no_body.flush().unwrap();
@@ -100,7 +96,8 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
 
     let text = read_log(&log_path);
     assert!(
-        text.lines().any(|l| l.contains("DEBUG") && l.contains("Connection closed by peer")),
+        text.lines()
+            .any(|l| l.contains("DEBUG") && l.contains("Connection closed by peer")),
         "a clean disconnect must be logged at DEBUG:\n{}",
         text
     );
@@ -114,5 +111,25 @@ fn clean_disconnect_is_a_debug_line_not_a_read_error() {
         "the two truncated requests (not the clean close) should produce NOTICEs, got {}:\n{}",
         notices.len(),
         text
+    );
+
+    // 4) a method name with a newline must be escaped, not forge a log line.
+    let mut client = YarClient::connect(&addr).unwrap();
+    client.set_timeout(Duration::from_secs(2));
+    let _ = client.call("evil\nINJECTED", vec![]);
+    assert!(
+        wait_until(Duration::from_secs(5), || read_log(&log_path)
+            .contains("Method not found")),
+        "expected a method-not-found line:\n{}",
+        read_log(&log_path)
+    );
+    let text = read_log(&log_path);
+    assert!(
+        !text.contains("\nINJECTED"),
+        "method name was not escaped:\n{text}"
+    );
+    assert!(
+        text.contains("evil\\nINJECTED"),
+        "expected the escaped method name in the log:\n{text}"
     );
 }

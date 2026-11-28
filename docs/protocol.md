@@ -34,33 +34,31 @@
 | 4 | 2 | `version: u16` | 协议版本，恒为 0 |
 | 6 | 4 | `magic_num: u32` | 魔数 `0x80DFEC60`，解析时必须校验 |
 | 10 | 4 | `reserved: u32` | 标志位：`0x1` 持久连接 `PROTOCOL_PERSISTENT`，`0x2` ping，`0x4` list |
-| 14 | 32 | `provider: [u8;32]` | 客户端名称。render() 最多写入前 16 字节（Rust 客户端：`"Yar(Rust)-0.1.0"`） |
+| 14 | 32 | `provider: [u8;32]` | 客户端名称。render() 最多写入 31 字节并保留结尾 NUL（Rust 客户端：`"Yar(Rust)-0.1.0"`） |
 | 46 | 32 | `token: [u8;32]` | 鉴权 token，未使用，全零 |
 | 78 | 4 | `body_len: u32` | body 长度 = 8 + msgpack 体长 |
 
-注意：`YarHeader` 是 `#[repr(C, packed)]` 结构。**直接按字段名读取 `u32` 数值字段
-编译会被拒绝（packed 对齐问题）**；请使用 `to_bytes()` / `from_bytes()` 在
-线上字节上操作，`provider`/`token`（字节数组）除外。这是与线上字节交互的推荐方式。
+注意：`YarHeader` 的数值字段是**主机字节序**，可以直接按字段名读取/写入。
+与网络交互时使用 `to_bytes()` 生成大端线上字节、`from_bytes()` 解析并校验魔数。
 
 ```rust
 use yar_rs::{YarHeader, PROTOCOL_PERSISTENT, HEADER_SIZE};
 
 let mut header = YarHeader::new();
-// 参数：id, provider(最多写入 16 字节), token(最多写入 16 字节), body_len, reserved(标志位)
+// 参数：id, provider(最多 31 字节), token(最多 31 字节), body_len, reserved(标志位)
+// render() 写入的是主机字节序字段，不需要再调用 parse()。
 header.render(1000, Some("Yar(Rust)-0.1.0"), None, 128, PROTOCOL_PERSISTENT);
-// render() 之后的字段是网络字节序，parse() 校验魔数并转回主机序，供 to_bytes() 序列化
-header.parse().unwrap();
 
-// 线上字节（大端）：可以直接 send 给 server / client
+// to_bytes() 生成线上大端字节，可以直接 send 给 server / client
 let wire = header.to_bytes();
-assert_eq!(wire.len(), std::mem::size_of::<yar_rs::YarHeader>()); // 82
+assert_eq!(wire.len(), HEADER_SIZE); // 82
 
 // 对端解析（校验魔数 0x80DFEC60，不匹配返回 Err）
 let parsed = YarHeader::from_bytes(&wire).unwrap();
+assert_eq!(parsed.id, 1000);
+assert_eq!(parsed.body_len, 128);
 let wire_id = u32::from_be_bytes(wire[0..4].try_into().unwrap());
-let wire_body_len = u32::from_be_bytes(wire[78..82].try_into().unwrap());
 assert_eq!(wire_id, 1000);
-assert_eq!(wire_body_len, 128);
 ```
 
 ## msgpack 请求体
@@ -88,7 +86,7 @@ map(i=1000, m="add", p=[10, 20])
 ```text
 {
   "i": <unsigned int>,    请求 ID（原样返回）
-  "s": <int>,             状态码：0 = 成功，非 0 = 错误
+  "s": <int>,             状态码：0 = 成功，非 0 = 错误；服务端生成的错误统一为 8（C 的 YAR_ERROR）
   "r": <any> 或 <null>,   返回值；出错时无
   "e": <string> 或 <null> 错误信息；成功时为 null
 }

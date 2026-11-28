@@ -26,10 +26,14 @@ Usage: run.sh --target <rust|c> [options]
 Options:
   --target <rust|c>   Which server image to benchmark (required)
   --matrix <full|quick>  Stage matrix (default: full)
-                        full  = profiler defaults: sizes 256b,1k,4k,16k,64k,
+                        full  = profiler defaults: sizes 0,256b,1k,4k,16k,64k,
                                 256k,512k,1m,2m,4m x vus 10,20,40,80,160,320,640
-                        quick = sizes 1k,64k,1m,4m x vus 10,40,160,640
+                        quick = sizes 0,1k,64k x vus 10,40,160,640 (small-body smoke;
+                                run 1m/4m separately with --sizes/--vus)
   --cpus <n>          --cpus for BOTH server and profiler containers (default: 2)
+  --client-cpus <n>   --cpus for the profiler container (default: --cpus).
+                        Give the generator headroom to show a stage is not
+                        generator-bound; the server stays at --cpus.
   --memory <size>     --memory / --memory-swap for both SERVERS (default: 2g)
   --inflight <n>      Server in-flight limit (default: 0 = unlimited).
                         Rust: --inflight N is a *connection* gate — a permit is
@@ -37,7 +41,14 @@ Options:
                         only N VUs are ever served and the rest time out.
                         C: -n N event-loop workers; with 0 the C server keeps
                         its own default of 2 workers.
-  --step-time <dur>   Per-stage profile duration, s/ms suffix (default: 10s)
+  --step-time <dur>   Per-stage measured duration, s/ms suffix (default: 10s)
+  --warmup <dur>      Per-stage warmup before measuring (default: 2s)
+  --access-log        Run both servers with the per-request access log on.
+                        Default off: the C image's benchmark build gates its
+                        OKEY log behind YAR_BENCH_ACCESS_LOG so the comparison
+                        does not measure one-sided log I/O.
+  --sizes <csv>       Override the body ladder (b/k/m suffix allowed)
+  --vus <csv>         Override the VU ladder (bare integers)
   --out-dir <dir>     Output directory for the final report CSV (default: results)
   --port <n>          Server listen port via host network (default: 9501)
   -h, --help          Show this help
@@ -54,15 +65,20 @@ C_IMG=localhost/yar-bench-c:latest
 TARGET=""
 MATRIX=full
 CPUS=2
+CLIENT_CPUS=""
 MEM=2g
 INFLIGHT=0
 STEP=10s
+WARMUP=2s
+ACCESS_LOG=0
+SIZES_OVERRIDE=""
+VUS_OVERRIDE=""
 OUT_DIR=results
 PORT=9501
 
 while [ $# -gt 0 ]; do
 	case $1 in
-	--target | --matrix | --cpus | --memory | --inflight | --step-time | --out-dir | --port)
+	--target | --matrix | --cpus | --client-cpus | --memory | --inflight | --step-time | --warmup | --sizes | --vus | --out-dir | --port)
 		if [ $# -lt 2 ]; then
 			echo "run.sh: missing value for $1" >&2
 			usage
@@ -72,13 +88,21 @@ while [ $# -gt 0 ]; do
 		--target) TARGET=$2 ;;
 		--matrix) MATRIX=$2 ;;
 		--cpus) CPUS=$2 ;;
+		--client-cpus) CLIENT_CPUS=$2 ;;
 		--memory) MEM=$2 ;;
 		--inflight) INFLIGHT=$2 ;;
 		--step-time) STEP=$2 ;;
+		--warmup) WARMUP=$2 ;;
+		--sizes) SIZES_OVERRIDE=$2 ;;
+		--vus) VUS_OVERRIDE=$2 ;;
 		--out-dir) OUT_DIR=$2 ;;
 		--port) PORT=$2 ;;
 		esac
 		shift 2
+		;;
+	--access-log)
+		ACCESS_LOG=1
+		shift
 		;;
 	-h | --help)
 		usage
@@ -113,14 +137,39 @@ esac
 case $STEP in
 '' | [!0-9]*) die_usage "--step-time must be a duration with an s/ms suffix, e.g. 10s (got '$STEP')" ;;
 esac
+case $WARMUP in
+'' | [!0-9]*) die_usage "--warmup must be a duration with an s/ms suffix, e.g. 2s (got '$WARMUP')" ;;
+esac
+case $CPUS in
+'' | *[!0-9]*) die_usage "--cpus must be a positive integer (got '$CPUS')" ;;
+esac
+[ -n "$CLIENT_CPUS" ] || CLIENT_CPUS=$CPUS
+case $CLIENT_CPUS in
+'' | *[!0-9]*) die_usage "--client-cpus must be a positive integer (got '$CLIENT_CPUS')" ;;
+esac
+# Server read timeout, shared by both targets (C's default is 3 s).
+READ_TIMEOUT_S=3
 
 if [ "$MATRIX" = quick ]; then
+	# Small-body, high-VU smoke matrix. Large bodies need targeted runs:
+	#   --sizes 1m --vus 10,40,160
+	#   --sizes 4m --vus 10,40
+	# (4 MiB x 640 VUs needs >2.5 GiB of server body buffers alone and
+	# OOM-kills a 2 GiB server; see profile/README.md.)
 	VUS="10,40,160,640"
-	SIZES="1k,64k,1m,4m"
+	SIZES="0,1k,64k"
 else
 	# full = profiler's own defaults (src/profiler.rs DEFAULT_SIZES / DEFAULT_VUS).
+	# The large-body, high-VU cells are memory-bound at 2 GiB; use --sizes/--vus
+	# for a runnable subset.
 	VUS="10,20,40,80,160,320,640"
-	SIZES="256b,1k,4k,16k,64k,256k,512k,1m,2m,4m"
+	SIZES="0,256b,1k,4k,16k,64k,256k,512k,1m,2m,4m"
+fi
+if [ -n "$SIZES_OVERRIDE" ]; then
+	SIZES=$SIZES_OVERRIDE
+fi
+if [ -n "$VUS_OVERRIDE" ]; then
+	VUS=$VUS_OVERRIDE
 fi
 
 print_build_help() {
@@ -196,9 +245,13 @@ trap cleanup EXIT
 trap 'echo "run.sh: interrupted/failing; cleaning up" >&2; cleanup; exit 130' INT TERM
 
 # --------------------------------------------------------------------------
-# cgroup poller: runs on the HOST, reads the container's cgroup v2 files
+# cgroup poller: runs on the HOST, reads the containers' cgroup v2 files
 # directly (podman exec would execute inside the container cgroup and skew
 # the CPU numbers with exec-side helper processes).
+#
+# Columns: ts,srv_usage_usec,srv_memory_current,srv_nr_throttled,prof_usage_usec
+# The profiler container does not exist for the first few samples; its column
+# is empty until the container can be resolved.
 # --------------------------------------------------------------------------
 poller() {
 	local pid cgv2 fails=0
@@ -206,16 +259,31 @@ poller() {
 	cgv2=$(awk -F'::' '{print $2}' "/proc/$pid/cgroup")
 	local path_cpu="/sys/fs/cgroup${cgv2}/cpu.stat"
 	local path_mem="/sys/fs/cgroup${cgv2}/memory.current"
+	local prof_cg="" prof_path=""
 	while true; do
-		local ts cpu mem
+		local ts cpu mem thr prof_cpu ppid
 		ts=$(date +%s.%N)
 		# `|| true` matters: with `set -e` a failing read would kill this
 		# subshell on the first miss, leaving the run without samples and
 		# without an abort. Failures must reach the counter below.
 		cpu=$(awk '$1=="usage_usec" { print $2; exit }' "$path_cpu" 2>/dev/null || true)
 		mem=$(cat "$path_mem" 2>/dev/null || true)
+		thr=$(awk '$1=="nr_throttled" { print $2; exit }' "$path_cpu" 2>/dev/null || true)
+
+		if [ -z "$prof_cg" ]; then
+			ppid=$(podman inspect --format '{{.State.Pid}}' "$PROF" 2>/dev/null || true)
+			if [ -n "$ppid" ]; then
+				prof_cg=$(awk -F'::' '{print $2}' "/proc/$ppid/cgroup" 2>/dev/null || true)
+				[ -n "$prof_cg" ] && prof_path="/sys/fs/cgroup${prof_cg}/cpu.stat"
+			fi
+		fi
+		prof_cpu=""
+		if [ -n "$prof_path" ]; then
+			prof_cpu=$(awk '$1=="usage_usec" { print $2; exit }' "$prof_path" 2>/dev/null || true)
+		fi
+
 		if [ -n "$cpu" ] && [ -n "$mem" ]; then
-			printf '%s,%s,%s\n' "$ts" "$cpu" "$mem" >>"$CG_CSV"
+			printf '%s,%s,%s,%s,%s\n' "$ts" "$cpu" "$mem" "${thr:-0}" "${prof_cpu:-}" >>"$CG_CSV"
 			fails=0
 		else
 			fails=$((fails + 1))
@@ -235,19 +303,29 @@ poller() {
 	done
 }
 
-echo "[1/4] server: $SRV_IMG ($TARGET, inflight=$INFLIGHT, cpus=$CPUS, mem=$MEM)"
+echo "[1/4] server: $SRV_IMG ($TARGET, inflight=$INFLIGHT, cpus=$CPUS, mem=$MEM, access_log=$ACCESS_LOG)"
+SERVER_ENVS=()
 if [ "$TARGET" = rust ]; then
-	# --max-request-size 8m (binary default): a full 4 MiB body + 82-byte
-	# header + msgpack envelope is 4194333 bytes, which a 4m cap rejects
-	# outright, so the mandated 4m stage would fail every request.
-	SERVER_ARGS=(--host "0.0.0.0:$PORT" --inflight "$INFLIGHT" --max-request-size 8m --read-timeout 5s)
+	# 10m is the binary/C default; a full 4 MiB body + 82-byte header +
+	# msgpack envelope is 4194333 bytes, so 10m covers the mandated 4m stage.
+	SERVER_ARGS=(--host "0.0.0.0:$PORT" --inflight "$INFLIGHT" --max-request-size 10m --read-timeout "${READ_TIMEOUT_S}s" --log-file /tmp/yar-rs.log)
+	if [ "$ACCESS_LOG" != 1 ]; then
+		SERVER_ARGS+=(--no-access-log)
+	fi
+	# Pin the Tokio worker count explicitly instead of relying on
+	# available_parallelism() honouring the cgroup quota (it does on rustc
+	# 1.99, but this keeps the 2-vs-2 worker parity across toolchains).
+	SERVER_ENVS=(-e "TOKIO_WORKER_THREADS=$CPUS")
 else
 	# Worker-count peer: an explicit --inflight N is passed to both servers;
 	# 0 means "unlimited connections" on the Rust side, whose C peer is the
 	# C server's own default of 2 event-loop workers.
 	C_WORKERS=2
 	[ "$INFLIGHT" -gt 0 ] && C_WORKERS=$INFLIGHT
-	SERVER_ARGS=(-S "0.0.0.0:$PORT" -n "$C_WORKERS" -l /tmp/yar-c.log)
+	SERVER_ARGS=(-S "0.0.0.0:$PORT" -n "$C_WORKERS" -l /tmp/yar-c.log -t "$READ_TIMEOUT_S")
+	if [ "$ACCESS_LOG" = 1 ]; then
+		SERVER_ENVS=(-e YAR_BENCH_ACCESS_LOG=1)
+	fi
 fi
 podman run -d \
 	--name "$SRV" \
@@ -255,6 +333,7 @@ podman run -d \
 	--network=host \
 	--ulimit nofile=65536 \
 	--http-proxy=false \
+	"${SERVER_ENVS[@]}" \
 	"$SRV_IMG" "${SERVER_ARGS[@]}" >/dev/null
 
 # Readiness gate: accept on 127.0.0.1:$PORT within 10 s, abort with logs if not.
@@ -284,19 +363,16 @@ sleep 0.3 # let the poller record a first sample before load starts
 # --------------------------------------------------------------------------
 # Load: the Rust profiler binary, containerized for identical host overhead.
 # --------------------------------------------------------------------------
-echo "[3/4] profiler: matrix=$MATRIX vus=$VUS sizes=$SIZES step=$STEP out=$PROF_CSV"
-# The profiler itself holds several copies of the body per VU thread (request
-# payload, response body, validation buffer), so its footprint scales with
-# VUs x body size: at 4m x 640 VU it peaks at ~4.1 GB (measured) and a 2g or
-# 4g cap gets it OOM-killed mid-run (exit 137, no CSV at all). Tuning the
-# allocator (MALLOC_ARENA_MAX) is NOT an option: it halves the small-body
-# throughput the profiler can generate and would silently skew every 256B-64k
-# stage. The SERVERS above keep the mandated 2g; the load generator gets room.
+echo "[3/4] profiler: matrix=$MATRIX vus=$VUS sizes=$SIZES step=$STEP warmup=$WARMUP cpus=$CLIENT_CPUS out=$PROF_CSV"
+# The profiler holds the prebuilt request packet plus the parsed response per
+# VU thread, so its footprint scales with VUs x body size: at 4m x 640 VU it
+# peaks at several GB and a 2g/4g cap gets it OOM-killed mid-run (exit 137, no
+# CSV at all). The SERVERS above keep the mandated 2g; the generator gets room.
 PROF_MEM=6g
 set +e
 podman run --rm \
 	--name "$PROF" \
-	--cpus="$CPUS" --memory="$PROF_MEM" --memory-swap="$PROF_MEM" \
+	--cpus="$CLIENT_CPUS" --memory="$PROF_MEM" --memory-swap="$PROF_MEM" \
 	--network=host \
 	--ulimit nofile=65536 \
 	--http-proxy=false \
@@ -304,7 +380,7 @@ podman run --rm \
 	-v "$OUT_DIR:/out:Z" \
 	"$RUST_IMG" \
 	--host "127.0.0.1:$PORT" \
-	--vus "$VUS" --sizes "$SIZES" --step-time "$STEP" \
+	--vus "$VUS" --sizes "$SIZES" --step-time "$STEP" --warmup "$WARMUP" \
 	--out "/out/profiler-$TARGET-$$.csv"
 PROF_RC=$?
 set -e
@@ -333,17 +409,18 @@ if [ ! -s "$PROF_CSV" ]; then
 fi
 
 # --------------------------------------------------------------------------
-# Merge: cgroup samples -> per-row cpu_pct / mem_peak. Both inputs are
-# comma-separated (the poller writes its three columns with commas so a
-# single -F',' serves both files; first_error may still contain commas,
-# which is handled by counting epoch columns from the row end).
+# Merge: cgroup samples -> per-row cpu_pct / mem_peak / client_cpu_pct /
+# srv_throttled. Both inputs are comma-separated; first_error may contain
+# commas, so epoch columns are counted from the row end.
 #
-# Window per row = [start_ts, end_ts] (epoch seconds from the profiler CSV),
-# including samples with ts >= start_ts && ts <= end_ts + 0.999 so the whole
-# last second is covered.
+# Window per row = [start_ts, end_ts] (fractional epoch seconds from the
+# profiler CSV), plus 50 ms for the last poller sample.
 #
-#   cpu_pct  = (cpu_last - cpu_first) / (ts_last - ts_first) / 1e6 / CPUS * 100
-#   mem_peak = max(memory.current) over the window
+#   cpu_pct        = (srv_usage_last - srv_usage_first) / dt / 1e6 / CPUS * 100
+#   mem_peak       = max(memory.current) over the window
+#   client_cpu_pct = same formula for the profiler container / CLIENT_CPUS
+#                    (-1 when the profiler cgroup was never sampled)
+#   srv_throttled  = delta of cpu.stat nr_throttled over the window
 #
 # If the window holds fewer than 2 samples, fall back to the nearest sample
 # on each side; if there are no samples at all, emit 0/0 with a warning.
@@ -351,7 +428,7 @@ fi
 REPORT="$OUT_DIR/report-$TARGET-$(date +%s).csv"
 TMP_REPORT="$OUT_DIR/.report-$TARGET-$$.csv"
 
-awk -F',' -v cpus="$CPUS" '
+awk -F',' -v cpus="$CPUS" -v client_cpus="$CLIENT_CPUS" '
 # Select the cgroup file by name, not by NR == FNR: with an empty first file
 # the two counters stay equal and every profiler row would be parsed as a
 # cgroup sample.
@@ -360,19 +437,22 @@ FILENAME == ARGV[1] {
 	ts[n] = $1 + 0
 	cpu[n] = $2 + 0
 	mem[n] = $3 + 0
+	thr[n] = $4 + 0
+	prof[n] = $5 + 0
+	prof_ok[n] = ($5 == "" ? 0 : 1)
 	next
 }
 FNR == 1 {
-	print "size_bytes,vus,duration_s,qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts,cpu_pct,mem_peak"
+	print "size_bytes,vus,duration_s,qps,ok_qps,ok,fail,p50_ms,p95_ms,p99_ms,p999_ms,first_error,start_ts,end_ts,cpu_pct,mem_peak,client_cpu_pct,srv_throttled"
 	next
 }
 {
-	# first_error (field 11) may contain commas, so count epoch columns
-	# from the END of the row instead of trusting $12/$13.
-	sh = NF - 13
-	st = $(12 + sh) + 0
-	et = $(13 + sh) + 0
-	lim = et + 0.999
+	# first_error (field 12) may contain commas, so count epoch columns
+	# from the END of the row instead of trusting $13/$14.
+	sh = NF - 14
+	st = $(13 + sh) + 0
+	et = $(14 + sh) + 0
+	lim = et + 0.05
 	fi = 0
 	li = 0
 	for (i = 1; i <= n; i++) {
@@ -409,6 +489,8 @@ FNR == 1 {
 	}
 	cpu_pct = 0
 	mem_peak = 0
+	client_cpu_pct = -1
+	srv_throttled = 0
 	if (first != 0 && last != 0) {
 		dt = ts[last] - ts[first]
 		dc = cpu[last] - cpu[first]
@@ -417,8 +499,22 @@ FNR == 1 {
 		hi = (first < last ? last : first)
 		for (i = lo; i <= hi; i++)
 			if (mem[i] > mem_peak) mem_peak = mem[i]
+		if (thr[hi] >= thr[lo]) srv_throttled = thr[hi] - thr[lo]
+		cf = 0
+		cl = 0
+		for (i = lo; i <= hi; i++) {
+			if (prof_ok[i]) {
+				if (cf == 0) cf = i
+				cl = i
+			}
+		}
+		if (cf != 0 && cl - cf >= 1) {
+			dtc = ts[cl] - ts[cf]
+			dcc = prof[cl] - prof[cf]
+			if (dtc > 0 && dcc >= 0) client_cpu_pct = dcc / dtc / 1e6 / client_cpus * 100
+		}
 	}
-	printf "%s,%.1f,%d\n", $0, cpu_pct, mem_peak
+	printf "%s,%.1f,%d,%.1f,%d\n", $0, cpu_pct, mem_peak, client_cpu_pct, srv_throttled
 }
 ' "$CG_CSV" "$PROF_CSV" >"$TMP_REPORT"
 
@@ -434,18 +530,21 @@ rm -f "$PROF_CSV" "$CG_CSV"
 
 echo "[4/4] done"
 echo
-echo "size      vus   qps         ok       fail  p50      p95      p99      p99.9    cpu%    memMB"
+echo "size      vus   ok_qps      ok       fail  p50      p95      p99      p99.9    cpu%    memMB client% thr"
 awk -F',' '
 FNR == 1 {
 	next
 }
 {
-	# first_error (field 11) may contain commas, so only the columns after
-	# it shift (p50..p999 are fields 7-10, i.e. before it).
-	sh = NF - 15
-	printf "%-9s %-5s %-11s %-8s %-5s %-8s %-8s %-8s %-8s %-7s %.1f\n",
-		$1, $2, $4, $5, $6, $7, $8, $9, $10, $(14 + sh), $(15 + sh) / 1048576
+	# first_error (field 12) may contain commas; the last four columns are
+	# appended by the merge, so count from the row end.
+	sh = NF - 18
+	printf "%-9s %-5s %-11s %-8s %-5s %-8s %-8s %-8s %-8s %-7s %.1f %-7s %s\n",
+		$1, $2, $5, $6, $7, $8, $9, $10, $11, $(15 + sh), $(16 + sh) / 1048576, $(17 + sh), $(18 + sh)
 }
 ' "$REPORT"
 echo
 echo "report: $REPORT"
+echo "note: client% is the profiler container's share of --client-cpus;"
+echo "      a stage with client% near 100 is generator-bound and says nothing"
+echo "      about the server's capacity."

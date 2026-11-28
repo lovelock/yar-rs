@@ -1,0 +1,12 @@
+# Changelog
+
+## 0.1.0 - 2026-11-27
+
+Initial release.
+
+- Wire-compatible Yar protocol header, request, response and MSGPACK packager.
+- Blocking TCP / Unix-socket client with persistent connections.
+- Tokio-based server with per-method handlers, bounded in-flight connections,
+  idle and total request deadlines, and a bounded response write.
+- File/stderr/pipe logger compatible with the C log format.
+- Optional `profiler` feature with the C-vs-Rust benchmark tooling.

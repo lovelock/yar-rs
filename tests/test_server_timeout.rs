@@ -72,9 +72,7 @@ fn build_request(body: &[u8]) -> Vec<u8> {
 
     let mut header = YarHeader::new();
     header.render(7, Some(CLIENT_NAME), None, body_len, PROTOCOL_PERSISTENT);
-    let header_bytes: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let header_bytes = header.to_bytes();
     payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
     payload[HEADER_SIZE..extra].copy_from_slice(PACKAGER_NAME);
     payload
@@ -101,8 +99,12 @@ fn trickling_body_is_not_cut_off_by_the_idle_timeout() {
 
     let payload = build_request(&[b'x'; 4096]);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Header first, then the body in 8 chunks with 100 ms gaps: every gap is
     // well under the 300 ms idle timeout, but the request as a whole takes
@@ -142,9 +144,7 @@ fn silent_peer_is_disconnected_after_the_idle_timeout() {
     // Announce a 1 KiB body but never send it.
     let mut header = YarHeader::new();
     header.render(1, None, None, 1024, 0);
-    let header_bytes: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let header_bytes = header.to_bytes();
     stream.write_all(&header_bytes).unwrap();
 
     let started = Instant::now();

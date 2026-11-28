@@ -13,7 +13,7 @@
 | `Pack(String)` | `Pack error:` | msgpack 打包/解析失败 |
 | `Io(std::io::Error)` | `IO error:` | 网络读写 IO 失败 |
 | `Connection(String)` | `Connection error:` | 连接失败；`call` 期间对端关闭（如"connection closed: expected 82 bytes, got 0" —— 非持久 client 调第二次 call 的典型症状）；`http://` 地址等 |
-| `Timeout` | `Timeout` | （保留变体） |
+| `Timeout` | `Timeout` | 连接/读写/请求超时 |
 | `InvalidMagic` | `Invalid magic number` | 对端发来的不是 Yar 协议（魔数校验失败） |
 | `UnsupportedPackager(String)` | `Unsupported packager:` | 对端使用了非 `MSGPACK\0` 的打包器名 |
 | `MethodNotFound(String)` | `Method not found:` | **服务端**未注册该方法（自动回包给客户端，客户端在 `status`/`error` 里看到此消息） |
@@ -38,7 +38,7 @@ assert!(matches!(err2, YarError::Connection(_)));
 
 **业务错误不产生 `Err`，只体现在响应状态里**：
 
-```rust
+```text
 // 服务端 handler：
 let mut resp = YarResponse::new(req.id());
 resp.set_error(10000, "division by zero");
@@ -51,7 +51,9 @@ assert_eq!(resp.get_error(), Some("division by zero"));
 assert!(resp.get_response().is_none());          // 出错时没有返回值
 ```
 
-错误信息超过 1024 字节会被截断并追加 `"..."`（与 C 结果一致）。
+错误信息按 C 的 1024 字节缓冲区截断为 1023 字节（前 1020 字节 + `"..."`）。
+服务端自动生成的错误（协议错误、未知方法、未知 packager、body 超限）统一使用
+status **8**（C 的 `YAR_ERROR`）。
 
 ## 三、日志系统 `logger` 模块
 
@@ -68,13 +70,26 @@ Yar 的日志系统是自带的独立实现（与 log/env_logger 等生态无关
 
 | 级别 | 数值 | 说明 |
 |---|---:|---|
-| `LogLevel::Ok` | 0 | 永远输出（不受阈值过滤） |
+| `LogLevel::Ok` | 0 | 访问日志（输出名 `OKEY`）；永远输出，不受阈值过滤 |
 | `LogLevel::Debug` | 1 | 调试信息 |
 | `LogLevel::Notice` | 2 | 常规通知（服务端默认阈值） |
 | `LogLevel::Warning` | 4 | 警告 |
 | `LogLevel::Error` | 8 | 错误 |
 
-过滤规则：`level < 阈值` 的消息被抑制；`Ok` 永远输出。
+过滤规则：`level < 阈值` 的消息被抑制；`OKEY` 永远输出。
+
+### 访问日志
+
+服务端默认对**每个完成的请求**写一条访问日志（与 C 的 `yar_server_log`
+一致）：成功为 `OKEY`，非 0 status 为 `ERROR`，消息体形如
+
+```text
+{id} {peer} "{method}" "{provider}" {bytes_sent} {elapsed_us}      # 成功
+{id} {peer} "{method}" {error} "{provider}" {bytes_sent} -         # 失败
+```
+
+方法名和错误信息中的 CR/LF 会被转义，避免对端伪造日志行。压测时用
+`set_access_log(false)`（或 `yar-server-rust --no-access-log`）关闭。
 
 ### 全局 logger
 

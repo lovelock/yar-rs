@@ -87,11 +87,14 @@ impl YarData {
         }
     }
 
-    /// Returns the numeric value as i64, converting from Ulong if needed.
+    /// Returns the numeric value as i64, converting from Ulong when it fits.
+    ///
+    /// Values above `i64::MAX` do not fit and yield `None` instead of wrapping
+    /// to a negative number.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             YarData::Long(v) => Some(*v),
-            YarData::Ulong(v) => Some(*v as i64),
+            YarData::Ulong(v) => i64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -172,6 +175,17 @@ impl Packager {
         Packager { buffer: Vec::new() }
     }
 
+    /// Creates a packager whose buffer starts with `prefix` zero bytes.
+    ///
+    /// `request.pack` / `response.pack` reserve the wire header and packager
+    /// name here and build the msgpack payload in the same buffer, avoiding a
+    /// second full-body copy.
+    pub(crate) fn with_prefix(prefix: usize) -> Self {
+        Packager {
+            buffer: vec![0u8; prefix],
+        }
+    }
+
     /// Creates a packager and writes an array header.
     pub fn start_array(size: u32) -> YarResult<Self> {
         let mut pk = Packager::new();
@@ -219,8 +233,7 @@ impl Packager {
 
     /// Writes a 64-bit float (always 9 bytes: 0xcb + 8 bytes).
     pub fn push_double(&mut self, val: f64) -> YarResult<()> {
-        rmp::encode::write_f64(&mut self.buffer, val)
-            .map_err(|e| YarError::Pack(e.to_string()))?;
+        rmp::encode::write_f64(&mut self.buffer, val).map_err(|e| YarError::Pack(e.to_string()))?;
         Ok(())
     }
 
@@ -302,6 +315,19 @@ impl Default for Packager {
 // Unpackager - msgpack parser
 // ---------------------------------------------------------------------------
 
+/// Maximum nesting depth accepted by the msgpack parser.
+///
+/// The parser is recursive, so an unbounded depth lets a small request
+/// overflow the stack (remote crash). 128 is far beyond any Yar payload in
+/// practice while staying comfortably inside a runtime worker stack.
+pub const MAX_PARSE_DEPTH: usize = 128;
+
+/// Maximum number of msgpack objects accepted from a single payload.
+///
+/// `YarData` is roughly 32 bytes per node, so an 8 MiB body made of `nil`
+/// markers would otherwise expand to hundreds of megabytes of memory.
+pub const MAX_PARSE_NODES: usize = 262_144;
+
 /// Parses msgpack bytes into a YarData tree.
 pub struct Unpackager {
     data: YarData,
@@ -309,9 +335,19 @@ pub struct Unpackager {
 
 impl Unpackager {
     /// Parses msgpack bytes into a data tree.
+    ///
+    /// Rejects inputs that are too deeply nested, declare lengths larger than
+    /// the remaining input, contain too many values, or have trailing bytes.
     pub fn new(data: &[u8]) -> YarResult<Self> {
-        let mut cursor = Cursor::new(data);
-        let parsed = parse_msgpack(&mut cursor)?;
+        let mut parser = Parser::new(data);
+        let parsed = parser.parse(0)?;
+        let consumed = parser.cursor.position() as usize;
+        if consumed != data.len() {
+            return Err(YarError::Pack(format!(
+                "trailing bytes after msgpack object: {}",
+                data.len() - consumed
+            )));
+        }
         Ok(Unpackager { data: parsed })
     }
 
@@ -330,92 +366,170 @@ impl Unpackager {
 // Low-level msgpack parsing using rmp::decode
 // ---------------------------------------------------------------------------
 
-/// Recursively parses one msgpack object from the cursor.
-///
-/// Peeks at the marker byte to determine the type, then dispatches to the
-/// appropriate rmp decode function which consumes the marker + data.
-fn parse_msgpack(cursor: &mut Cursor<&[u8]>) -> YarResult<YarData> {
-    // Peek at the marker without advancing the cursor position.
-    let marker = {
-        let pos = cursor.position() as usize;
-        let inner = *cursor.get_ref();
-        if pos >= inner.len() {
-            return Err(YarError::Pack("unexpected end of msgpack data".into()));
-        }
-        rmp::Marker::from_u8(inner[pos])
-    };
+/// Recursive msgpack parser state.
+struct Parser<'a> {
+    cursor: Cursor<&'a [u8]>,
+    nodes: usize,
+}
 
-    match marker {
-        // Nil
-        rmp::Marker::Null => {
-            rmp::decode::read_nil(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Null)
+impl<'a> Parser<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Parser {
+            cursor: Cursor::new(data),
+            nodes: 0,
         }
+    }
 
-        // Boolean
-        rmp::Marker::True | rmp::Marker::False => {
-            let val = rmp::decode::read_bool(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Bool(val))
+    fn remaining(&self) -> usize {
+        let len = self.cursor.get_ref().len();
+        len.saturating_sub(self.cursor.position() as usize)
+    }
+
+    /// Reject a declared length that cannot possibly fit in the remaining
+    /// input before allocating anything for it.
+    fn ensure_fits(&self, len: usize, min_bytes_per_item: usize, kind: &str) -> YarResult<()> {
+        let remaining = self.remaining();
+        let max_items = remaining / min_bytes_per_item;
+        if len > max_items {
+            return Err(YarError::Pack(format!(
+                "msgpack {} length {} exceeds remaining input ({} bytes)",
+                kind, len, remaining
+            )));
         }
+        Ok(())
+    }
 
-        // Unsigned integer types -> Ulong
-        // read_int::<u64> reads the marker + data for all unsigned integer formats
-        m if is_unsigned_marker(m) => {
-            let val = rmp::decode::read_int::<u64, _>(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Ulong(val))
+    /// Parses one msgpack object, enforcing depth and node-count limits.
+    fn parse(&mut self, depth: usize) -> YarResult<YarData> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_PARSE_NODES {
+            return Err(YarError::Pack(format!(
+                "msgpack node limit exceeded ({})",
+                MAX_PARSE_NODES
+            )));
         }
-
-        // Signed integer types -> Long
-        // read_int::<i64> reads the marker + data for all signed integer formats
-        m if is_signed_marker(m) => {
-            let val = rmp::decode::read_int::<i64, _>(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Long(val))
-        }
-
-        // Float64 (msgpack_pack_double always uses 0xcb + 8 bytes)
-        rmp::Marker::F64 => {
-            let val = rmp::decode::read_f64(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Double(val))
+        if depth > MAX_PARSE_DEPTH {
+            return Err(YarError::Pack(format!(
+                "msgpack depth limit exceeded ({})",
+                MAX_PARSE_DEPTH
+            )));
         }
 
-        // Float32 (not produced by C code, but handle for robustness)
-        rmp::Marker::F32 => {
-            let val = rmp::decode::read_f32(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))?;
-            Ok(YarData::Double(val as f64))
-        }
+        // Peek at the marker without advancing the cursor position.
+        let marker = {
+            let pos = self.cursor.position() as usize;
+            let inner = *self.cursor.get_ref();
+            if pos >= inner.len() {
+                return Err(YarError::Pack("unexpected end of msgpack data".into()));
+            }
+            rmp::Marker::from_u8(inner[pos])
+        };
 
-        // String types - read length header then raw bytes
-        rmp::Marker::FixStr(_) | rmp::Marker::Str8
-        | rmp::Marker::Str16 | rmp::Marker::Str32 => {
-            let len = rmp::decode::read_str_len(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))? as usize;
-            read_str_body(cursor, len)
-        }
+        match marker {
+            // Nil
+            rmp::Marker::Null => {
+                rmp::decode::read_nil(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Null)
+            }
 
-        // Array types
-        rmp::Marker::FixArray(_) | rmp::Marker::Array16 | rmp::Marker::Array32 => {
-            let len = rmp::decode::read_array_len(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))? as usize;
-            read_array(cursor, len)
-        }
+            // Boolean
+            rmp::Marker::True | rmp::Marker::False => {
+                let val = rmp::decode::read_bool(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Bool(val))
+            }
 
-        // Map types
-        rmp::Marker::FixMap(_) | rmp::Marker::Map16 | rmp::Marker::Map32 => {
-            let len = rmp::decode::read_map_len(cursor)
-                .map_err(|e| YarError::Pack(e.to_string()))? as usize;
-            read_map(cursor, len)
-        }
+            // Unsigned integer types -> Ulong
+            // read_int::<u64> reads the marker + data for all unsigned integer formats
+            m if is_unsigned_marker(m) => {
+                let val = rmp::decode::read_int::<u64, _>(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Ulong(val))
+            }
 
-        other => Err(YarError::Pack(format!(
-            "unsupported msgpack type marker: {:?}",
-            other
-        ))),
+            // Signed integer types -> Long
+            // read_int::<i64> reads the marker + data for all signed integer formats
+            m if is_signed_marker(m) => {
+                let val = rmp::decode::read_int::<i64, _>(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Long(val))
+            }
+
+            // Float64 (msgpack_pack_double always uses 0xcb + 8 bytes)
+            rmp::Marker::F64 => {
+                let val = rmp::decode::read_f64(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Double(val))
+            }
+
+            // Float32 (not produced by C code, but handle for robustness)
+            rmp::Marker::F32 => {
+                let val = rmp::decode::read_f32(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))?;
+                Ok(YarData::Double(val as f64))
+            }
+
+            // String types - read length header then raw bytes
+            rmp::Marker::FixStr(_)
+            | rmp::Marker::Str8
+            | rmp::Marker::Str16
+            | rmp::Marker::Str32 => {
+                let len = rmp::decode::read_str_len(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))? as usize;
+                self.ensure_fits(len, 1, "string")?;
+                self.read_str_body(len)
+            }
+
+            // Array types
+            rmp::Marker::FixArray(_) | rmp::Marker::Array16 | rmp::Marker::Array32 => {
+                let len = rmp::decode::read_array_len(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))? as usize;
+                self.ensure_fits(len, 1, "array")?;
+                self.read_array(len, depth + 1)
+            }
+
+            // Map types
+            rmp::Marker::FixMap(_) | rmp::Marker::Map16 | rmp::Marker::Map32 => {
+                let len = rmp::decode::read_map_len(&mut self.cursor)
+                    .map_err(|e| YarError::Pack(e.to_string()))? as usize;
+                self.ensure_fits(len, 2, "map")?;
+                self.read_map(len, depth + 1)
+            }
+
+            other => Err(YarError::Pack(format!(
+                "unsupported msgpack type marker: {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Reads `len` raw bytes from the cursor as a msgpack str body.
+    fn read_str_body(&mut self, len: usize) -> YarResult<YarData> {
+        let mut buf = vec![0u8; len];
+        Read::read_exact(&mut self.cursor, &mut buf)?;
+        Ok(YarData::String(buf))
+    }
+
+    /// Reads `len` msgpack objects into an array.
+    fn read_array(&mut self, len: usize, depth: usize) -> YarResult<YarData> {
+        // Never pre-allocate from a remotely supplied length.
+        let mut items = Vec::with_capacity(len.min(1024));
+        for _ in 0..len {
+            items.push(self.parse(depth)?);
+        }
+        Ok(YarData::Array(items))
+    }
+
+    /// Reads `len` key-value pairs into a map.
+    fn read_map(&mut self, len: usize, depth: usize) -> YarResult<YarData> {
+        let mut entries = Vec::with_capacity(len.min(1024));
+        for _ in 0..len {
+            let key = self.parse(depth)?;
+            let val = self.parse(depth)?;
+            entries.push((key, val));
+        }
+        Ok(YarData::Map(entries))
     }
 }
 
@@ -441,33 +555,6 @@ fn is_signed_marker(m: rmp::Marker) -> bool {
             | rmp::Marker::I32
             | rmp::Marker::I64
     )
-}
-
-/// Reads `len` raw bytes from the cursor as a msgpack str body.
-fn read_str_body(cursor: &mut Cursor<&[u8]>, len: usize) -> YarResult<YarData> {
-    let mut buf = vec![0u8; len];
-    Read::read_exact(cursor, &mut buf)?;
-    Ok(YarData::String(buf))
-}
-
-/// Reads `len` msgpack objects into an array.
-fn read_array(cursor: &mut Cursor<&[u8]>, len: usize) -> YarResult<YarData> {
-    let mut items = Vec::with_capacity(len);
-    for _ in 0..len {
-        items.push(parse_msgpack(cursor)?);
-    }
-    Ok(YarData::Array(items))
-}
-
-/// Reads `len` key-value pairs into a map.
-fn read_map(cursor: &mut Cursor<&[u8]>, len: usize) -> YarResult<YarData> {
-    let mut entries = Vec::with_capacity(len);
-    for _ in 0..len {
-        let key = parse_msgpack(cursor)?;
-        let val = parse_msgpack(cursor)?;
-        entries.push((key, val));
-    }
-    Ok(YarData::Map(entries))
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +584,7 @@ impl<'a> UnpackIterator<'a> {
 
     /// Advances to the next item. Returns the new position, or 0 at end.
     /// Matches C's `yar_unpack_iterator_next` which returns 0 when exhausted.
+    #[allow(clippy::should_implement_trait)] // mirrors the C API, not Iterator
     pub fn next(&mut self) -> usize {
         if self.position + 1 < self.items.len() {
             self.position += 1;
@@ -507,8 +595,12 @@ impl<'a> UnpackIterator<'a> {
     }
 
     /// Returns the current item.
+    ///
+    /// For an empty container there is no current item, so `Null` is returned
+    /// instead of panicking.
     pub fn current(&self) -> &'a YarData {
-        self.items[self.position]
+        static NULL_DATA: YarData = YarData::Null;
+        self.items.get(self.position).copied().unwrap_or(&NULL_DATA)
     }
 
     /// Resets the iterator to the beginning.

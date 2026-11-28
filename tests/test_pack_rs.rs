@@ -221,7 +221,10 @@ fn test_roundtrip_all_types() {
         (YarData::String(b"long".to_vec()), YarData::Long(-42)),
         (YarData::String(b"ulong".to_vec()), YarData::Ulong(1000)),
         (YarData::String(b"double".to_vec()), YarData::Double(3.14)),
-        (YarData::String(b"string".to_vec()), YarData::String(b"hello".to_vec())),
+        (
+            YarData::String(b"string".to_vec()),
+            YarData::String(b"hello".to_vec()),
+        ),
         (
             YarData::String(b"array".to_vec()),
             YarData::Array(vec![YarData::Ulong(1), YarData::Ulong(2), YarData::Null]),
@@ -291,11 +294,7 @@ fn test_push_packager_embeds_raw_bytes() {
 
 #[test]
 fn test_array_iterator_matches_c_behavior() {
-    let data = YarData::Array(vec![
-        YarData::Null,
-        YarData::Bool(true),
-        YarData::Ulong(42),
-    ]);
+    let data = YarData::Array(vec![YarData::Null, YarData::Bool(true), YarData::Ulong(42)]);
 
     let mut it = data.iter().unwrap();
     assert_eq!(it.size(), 3);
@@ -321,7 +320,10 @@ fn test_map_iterator_interleaved() {
     // Map iterator yields: key0, value0, key1, value1, ...
     // Size = entries * 2 (matching C behavior)
     let data = YarData::Map(vec![
-        (YarData::String(b"name".to_vec()), YarData::String(b"yar".to_vec())),
+        (
+            YarData::String(b"name".to_vec()),
+            YarData::String(b"yar".to_vec()),
+        ),
         (YarData::String(b"version".to_vec()), YarData::Ulong(1)),
     ]);
 
@@ -392,10 +394,22 @@ fn test_into_data_consumes_unpackager() {
 #[test]
 fn test_data_type_and_size() {
     assert_eq!(YarData::Null.data_type_and_size(), (YarDataType::Null, 0));
-    assert_eq!(YarData::Bool(true).data_type_and_size(), (YarDataType::Bool, 0));
-    assert_eq!(YarData::Long(-5).data_type_and_size(), (YarDataType::Long, 0));
-    assert_eq!(YarData::Ulong(10).data_type_and_size(), (YarDataType::Ulong, 0));
-    assert_eq!(YarData::Double(1.0).data_type_and_size(), (YarDataType::Double, 0));
+    assert_eq!(
+        YarData::Bool(true).data_type_and_size(),
+        (YarDataType::Bool, 0)
+    );
+    assert_eq!(
+        YarData::Long(-5).data_type_and_size(),
+        (YarDataType::Long, 0)
+    );
+    assert_eq!(
+        YarData::Ulong(10).data_type_and_size(),
+        (YarDataType::Ulong, 0)
+    );
+    assert_eq!(
+        YarData::Double(1.0).data_type_and_size(),
+        (YarDataType::Double, 0)
+    );
     assert_eq!(
         YarData::String(b"hi".to_vec()).data_type_and_size(),
         (YarDataType::String, 2)

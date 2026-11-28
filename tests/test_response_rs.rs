@@ -23,15 +23,8 @@ fn test_response_c_vector_success() {
     //   0xa1 0x65                                fixstr(1) "e"
     //   0xc0                                     nil
     let expected: Vec<u8> = vec![
-        0x84,
-        0xa1, 0x69,
-        0xcd, 0x03, 0xe8,
-        0xa1, 0x73,
-        0x00,
-        0xa1, 0x72,
-        0xa6, 0x72, 0x65, 0x73, 0x75, 0x6c, 0x74,
-        0xa1, 0x65,
-        0xc0,
+        0x84, 0xa1, 0x69, 0xcd, 0x03, 0xe8, 0xa1, 0x73, 0x00, 0xa1, 0x72, 0xa6, 0x72, 0x65, 0x73,
+        0x75, 0x6c, 0x74, 0xa1, 0x65, 0xc0,
     ];
 
     // Pack with Rust and verify bytes match C output
@@ -64,14 +57,7 @@ fn test_response_c_vector_error() {
     //   "something went wrong" (22 bytes)
     let error_msg = b"something went wrong"; // 20 bytes
     let mut expected: Vec<u8> = vec![
-        0x84,
-        0xa1, 0x69,
-        0xcd, 0x07, 0xd0,
-        0xa1, 0x73,
-        0x08,
-        0xa1, 0x72,
-        0xc0,
-        0xa1, 0x65,
+        0x84, 0xa1, 0x69, 0xcd, 0x07, 0xd0, 0xa1, 0x73, 0x08, 0xa1, 0x72, 0xc0, 0xa1, 0x65,
     ];
     // fixstr(20) = 0xa0 | 20 = 0xb4
     expected.push(0xa0 | 20);
@@ -96,15 +82,8 @@ fn test_response_c_vector_error() {
 fn test_unpack_c_response_success() {
     // Bytes produced by C yar_response_pack for success response
     let c_bytes: Vec<u8> = vec![
-        0x84,
-        0xa1, 0x69,
-        0xcd, 0x03, 0xe8,
-        0xa1, 0x73,
-        0x00,
-        0xa1, 0x72,
-        0xa6, 0x72, 0x65, 0x73, 0x75, 0x6c, 0x74,
-        0xa1, 0x65,
-        0xc0,
+        0x84, 0xa1, 0x69, 0xcd, 0x03, 0xe8, 0xa1, 0x73, 0x00, 0xa1, 0x72, 0xa6, 0x72, 0x65, 0x73,
+        0x75, 0x6c, 0x74, 0xa1, 0x65, 0xc0,
     ];
 
     let resp = YarResponse::unpack(&c_bytes, 0).unwrap();
@@ -120,14 +99,7 @@ fn test_unpack_c_response_success() {
 fn test_unpack_c_response_error() {
     let error_msg = "something went wrong";
     let mut c_bytes: Vec<u8> = vec![
-        0x84,
-        0xa1, 0x69,
-        0xcd, 0x07, 0xd0,
-        0xa1, 0x73,
-        0x08,
-        0xa1, 0x72,
-        0xc0,
-        0xa1, 0x65,
+        0x84, 0xa1, 0x69, 0xcd, 0x07, 0xd0, 0xa1, 0x73, 0x08, 0xa1, 0x72, 0xc0, 0xa1, 0x65,
     ];
     c_bytes.push(0xa0 | error_msg.len() as u8);
     c_bytes.extend_from_slice(error_msg.as_bytes());
@@ -196,11 +168,11 @@ fn test_response_binary_compat_minimal() {
     let payload = resp.pack(0).unwrap();
 
     let expected: Vec<u8> = vec![
-        0x84,                   // fixmap(4)
-        0xa1, b'i', 0x01,       // "i" -> 1
-        0xa1, b's', 0x00,       // "s" -> 0
-        0xa1, b'r', 0xc0,       // "r" -> nil
-        0xa1, b'e', 0xc0,       // "e" -> nil
+        0x84, // fixmap(4)
+        0xa1, b'i', 0x01, // "i" -> 1
+        0xa1, b's', 0x00, // "s" -> 0
+        0xa1, b'r', 0xc0, // "r" -> nil
+        0xa1, b'e', 0xc0, // "e" -> nil
     ];
 
     assert_eq!(
@@ -246,11 +218,11 @@ fn test_response_error_truncation() {
     resp.set_error(1, "short error");
     assert_eq!(resp.get_error(), Some("short error"));
 
-    // Message over 1024 bytes: truncated with "..." appended
+    // Message over 1024 bytes: C truncates to 1023 bytes (1020 + "...")
     let long_msg = "x".repeat(2000);
     resp.set_error(1, &long_msg);
     let err = resp.get_error().unwrap();
-    assert_eq!(err.len(), 1027); // 1024 bytes + "..."
+    assert_eq!(err.len(), 1023); // 1020 bytes + "..."
     assert!(err.ends_with("..."));
 }
 

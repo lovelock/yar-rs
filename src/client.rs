@@ -4,30 +4,36 @@
 //! connections using synchronous I/O, matching the C client's blocking API.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crate::error::{YarError, YarResult};
 use crate::logger;
 use crate::pack::Packager;
-use crate::protocol::{YarHeader, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_PERSISTENT};
+use crate::protocol::{YarHeader, HEADER_SIZE, PROTOCOL_PERSISTENT};
 use crate::request::YarRequest;
 use crate::response::YarResponse;
-use crate::PACKAGER_NAME;
+use crate::{PACKAGER_NAME, PACKAGER_NAME_STR};
 
 /// Client name sent in the header provider field.
-pub const CLIENT_NAME: &str = "Yar(Rust)-0.1.0";
+pub const CLIENT_NAME: &str = concat!("Yar(Rust)-", env!("CARGO_PKG_VERSION"));
 
 /// Default request ID (matching C client's dummy id).
 const DEFAULT_REQUEST_ID: u64 = 1000;
 
-/// Default timeout in seconds (matching C client's default).
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
+/// Default read/write timeout in seconds (matching C client's 1 s default).
+const DEFAULT_TIMEOUT_SECS: u64 = 1;
+
+/// Default maximum response body size accepted by the client (10 MiB,
+/// matching `YAR_MAX_BODY_SIZE` in the C implementation).
+pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Transport connection type.
 enum Connection {
     Tcp(TcpStream),
+    #[cfg(unix)]
     Unix(UnixStream),
 }
 
@@ -35,6 +41,7 @@ impl Connection {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         match self {
             Connection::Tcp(s) => s.set_read_timeout(timeout),
+            #[cfg(unix)]
             Connection::Unix(s) => s.set_read_timeout(timeout),
         }
     }
@@ -42,6 +49,7 @@ impl Connection {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         match self {
             Connection::Tcp(s) => s.set_write_timeout(timeout),
+            #[cfg(unix)]
             Connection::Unix(s) => s.set_write_timeout(timeout),
         }
     }
@@ -51,6 +59,7 @@ impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Connection::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
             Connection::Unix(s) => s.read(buf),
         }
     }
@@ -60,6 +69,7 @@ impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Connection::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
             Connection::Unix(s) => s.write(buf),
         }
     }
@@ -67,6 +77,7 @@ impl Write for Connection {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Connection::Tcp(s) => s.flush(),
+            #[cfg(unix)]
             Connection::Unix(s) => s.flush(),
         }
     }
@@ -78,6 +89,10 @@ pub struct YarClient {
     hostname: String,
     persistent: bool,
     timeout: Duration,
+    max_response_size: usize,
+    /// Set after a failed call: the stream may still contain a late response,
+    /// so it can no longer be trusted for another request.
+    failed: bool,
 }
 
 impl std::fmt::Debug for YarClient {
@@ -86,12 +101,14 @@ impl std::fmt::Debug for YarClient {
             .field("hostname", &self.hostname)
             .field("persistent", &self.persistent)
             .field("timeout", &self.timeout)
+            .field("max_response_size", &self.max_response_size)
+            .field("failed", &self.failed)
             .finish()
     }
 }
 
 impl YarClient {
-    /// Connect to a Yar server.
+    /// Connect to a Yar server using the default connect timeout.
     ///
     /// Hostname formats:
     /// - `host:port` — TCP connection
@@ -99,26 +116,46 @@ impl YarClient {
     ///
     /// HTTP/HTTPS URLs are rejected since Yar uses a raw TCP protocol.
     pub fn connect(hostname: &str) -> YarResult<Self> {
+        Self::connect_with_timeout(hostname, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+    }
+
+    /// Connect to a Yar server with an explicit connect timeout and the
+    /// default read/write timeout.
+    ///
+    /// The connect timeout bounds DNS-resolved TCP connection attempts. Unix
+    /// domain socket connects are immediate and not affected.
+    pub fn connect_with_timeout(hostname: &str, connect_timeout: Duration) -> YarResult<Self> {
         if hostname.starts_with("http://") || hostname.starts_with("https://") {
             return Err(YarError::Connection(
                 "HTTP/HTTPS not supported; use host:port or /path for Unix socket".into(),
             ));
         }
 
+        let hostname = hostname.strip_prefix("tcp://").unwrap_or(hostname);
         let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
 
         let conn = if hostname.starts_with('/') {
-            // Unix domain socket
-            logger::log_global(
-                logger::LogLevel::Debug,
-                &format!("connecting to unix socket: {}", hostname),
-            );
-            let stream = UnixStream::connect(hostname).map_err(|e| {
-                YarError::Connection(format!("failed to connect to {}: {}", hostname, e))
-            })?;
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
-            Connection::Unix(stream)
+            #[cfg(unix)]
+            {
+                // Unix domain socket
+                logger::log_global(
+                    logger::LogLevel::Debug,
+                    &format!("connecting to unix socket: {}", hostname),
+                );
+                let stream = UnixStream::connect(hostname).map_err(|e| {
+                    YarError::Connection(format!("failed to connect to {}: {}", hostname, e))
+                })?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                Connection::Unix(stream)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = connect_timeout;
+                return Err(YarError::Connection(
+                    "Unix domain sockets are not supported on this platform".into(),
+                ));
+            }
         } else {
             // TCP — require host:port
             if !hostname.contains(':') {
@@ -132,9 +169,29 @@ impl YarClient {
                 &format!("connecting to tcp: {}", hostname),
             );
 
-            let stream = TcpStream::connect(hostname).map_err(|e| {
-                YarError::Connection(format!("failed to connect to {}: {}", hostname, e))
+            let addrs = resolve_with_timeout(hostname, connect_timeout)?;
+
+            let mut last_err = None;
+            let mut connected = None;
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, connect_timeout) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let stream = connected.ok_or_else(|| {
+                YarError::Connection(format!(
+                    "failed to connect to {}: {}",
+                    hostname,
+                    last_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no addresses resolved".into())
+                ))
             })?;
+
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
             stream.set_nodelay(true)?;
@@ -146,7 +203,14 @@ impl YarClient {
             hostname: hostname.to_string(),
             persistent: false,
             timeout,
+            max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+            failed: false,
         })
+    }
+
+    /// Sets the maximum response body size accepted from the server.
+    pub fn set_max_response_size(&mut self, bytes: usize) {
+        self.max_response_size = bytes;
     }
 
     /// Set the read/write timeout for the connection.
@@ -175,59 +239,78 @@ impl YarClient {
     /// Wire format received:
     ///   [82-byte header][8-byte packager name][msgpack response body]
     pub fn call(&mut self, method: &str, params: Vec<Packager>) -> YarResult<YarResponse> {
-        // Build the request
-        let mut request = YarRequest::new(DEFAULT_REQUEST_ID, method);
-        if !params.is_empty() {
+        if self.failed {
+            return Err(YarError::Connection(
+                "client connection is unusable after a failed call; reconnect with YarClient::connect"
+                    .into(),
+            ));
+        }
+
+        let result = self.call_inner(method, params);
+        if result.is_err() {
+            // A read timeout or protocol error can leave a late response in the
+            // stream. Reusing the socket would let the next call consume it.
+            self.failed = true;
+        }
+        result
+    }
+
+    fn call_inner(&mut self, method: &str, params: Vec<Packager>) -> YarResult<YarResponse> {
+        let params_pk = if params.is_empty() {
+            None
+        } else {
             let mut arr = Packager::start_array(params.len() as u32)?;
             for p in params {
                 arr.push_packager(&p)?;
             }
-            request.set_parameters(arr);
+            Some(arr)
+        };
+
+        let packet =
+            build_request_packet_with_id(DEFAULT_REQUEST_ID, method, params_pk, self.persistent)?;
+        let resp_body = self.call_raw_inner(&packet)?;
+        let response = YarResponse::unpack(&resp_body, PACKAGER_NAME.len())?;
+
+        if response.id != DEFAULT_REQUEST_ID {
+            return Err(YarError::Protocol(format!(
+                "response id {} does not match request id {}",
+                response.id, DEFAULT_REQUEST_ID
+            )));
         }
 
-        // Pack the request with extra bytes for header + packager name
-        let extra_bytes = HEADER_SIZE + 8;
-        let mut payload = request.pack(extra_bytes)?;
+        Ok(response)
+    }
 
-        // Build and render the header
-        let body_len = (payload.len() - HEADER_SIZE) as u32;
-        let reserved = if self.persistent {
-            PROTOCOL_PERSISTENT
-        } else {
-            0
-        };
+    /// Send an already-built wire packet and return the raw response body
+    /// (8-byte packager name + msgpack).
+    ///
+    /// Hot clients (the profiler) build the packet once with
+    /// [`build_request_packet`] and reuse it, avoiding a full repack per call.
+    pub fn call_raw(&mut self, packet: &[u8]) -> YarResult<Vec<u8>> {
+        if self.failed {
+            return Err(YarError::Connection(
+                "client connection is unusable after a failed call; reconnect with YarClient::connect"
+                    .into(),
+            ));
+        }
 
-        let mut header = YarHeader::new();
-        header.render(
-            DEFAULT_REQUEST_ID as u32,
-            Some(CLIENT_NAME),
-            None,
-            body_len,
-            reserved,
-        );
+        let result = self.call_raw_inner(packet);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
 
-        // Copy header bytes into the payload prefix.
-        // The header is #[repr(C, packed)] so we read it as raw bytes.
-        let header_bytes: [u8; HEADER_SIZE] = unsafe {
-            std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-        };
-        payload[..HEADER_SIZE].copy_from_slice(&header_bytes);
-
-        // Copy packager name after header
-        payload[HEADER_SIZE..HEADER_SIZE + 8].copy_from_slice(PACKAGER_NAME);
-
+    fn call_raw_inner(&mut self, packet: &[u8]) -> YarResult<Vec<u8>> {
         // Send the full payload
-        send_all(&mut self.conn, &payload)?;
+        send_all(&mut self.conn, packet)?;
 
-        logger::log_global(
-            logger::LogLevel::Debug,
-            &format!(
-                "sent request: method={}, body_len={}, total={}",
-                method,
-                body_len,
-                payload.len()
-            ),
-        );
+        if logger::enabled(logger::LogLevel::Debug) {
+            logger::log_global(
+                logger::LogLevel::Debug,
+                &format!("sent request: {} bytes", packet.len()),
+            );
+        }
 
         // Read the response header
         let mut resp_header_buf = [0u8; HEADER_SIZE];
@@ -237,34 +320,47 @@ impl YarClient {
         let resp_header =
             YarHeader::from_bytes(&resp_header_buf).map_err(|_| YarError::InvalidMagic)?;
 
-        if resp_header.magic_num != PROTOCOL_MAGIC {
-            return Err(YarError::InvalidMagic);
-        }
-
         let resp_body_len = resp_header.body_len as usize;
+
+        // Never allocate from an untrusted length before validating it.
+        if resp_body_len > self.max_response_size {
+            return Err(YarError::Protocol(format!(
+                "response body size {} exceeds limit {}",
+                resp_body_len, self.max_response_size
+            )));
+        }
+        if resp_body_len < PACKAGER_NAME.len() {
+            return Err(YarError::Protocol(format!(
+                "response body too short for packager name ({} bytes)",
+                resp_body_len
+            )));
+        }
 
         // Read the full response body (packager name + msgpack)
         let mut resp_body = vec![0u8; resp_body_len];
         recv_exact(&mut self.conn, &mut resp_body)?;
 
-        let resp_id = resp_header.id;
-        logger::log_global(
-            logger::LogLevel::Debug,
-            &format!(
-                "recv response: id={}, body_len={}",
-                resp_id, resp_body_len
-            ),
-        );
+        if logger::enabled(logger::LogLevel::Debug) {
+            logger::log_global(
+                logger::LogLevel::Debug,
+                &format!(
+                    "recv response: id={}, body_len={}",
+                    resp_header.id, resp_body_len
+                ),
+            );
+        }
 
-        // Combine header + body for unpacking
-        let mut full_resp = vec![0u8; HEADER_SIZE + resp_body_len];
-        full_resp[..HEADER_SIZE].copy_from_slice(&resp_header_buf);
-        full_resp[HEADER_SIZE..].copy_from_slice(&resp_body);
+        // Verify the packager before parsing its payload. Like C, compare the
+        // 7-byte tag and ignore the padding byte.
+        let tag_len = PACKAGER_NAME.len() - 1;
+        if resp_body[..tag_len] != PACKAGER_NAME[..tag_len] {
+            return Err(YarError::UnsupportedPackager(format!(
+                "response packager is not {}",
+                PACKAGER_NAME_STR
+            )));
+        }
 
-        // Unpack the response (skip header + 8-byte packager name)
-        let response = YarResponse::unpack(&full_resp, HEADER_SIZE + 8)?;
-
-        Ok(response)
+        Ok(resp_body)
     }
 
     /// Close the connection (consumes the client).
@@ -272,6 +368,75 @@ impl YarClient {
         // Dropping the connection closes it.
         drop(self);
     }
+}
+
+/// Resolve a host with a bound, so a hung resolver cannot block `connect`.
+///
+/// `to_socket_addrs` is a blocking, unbounded libc call; run it on a helper
+/// thread and give up after `timeout`.
+fn resolve_with_timeout(host: &str, timeout: Duration) -> YarResult<Vec<std::net::SocketAddr>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            host_owned
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>()),
+        );
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(YarError::Connection(format!(
+            "failed to connect to {}: resolution failed: {}",
+            host, e
+        ))),
+        Err(_) => Err(YarError::Connection(format!(
+            "failed to connect to {}: resolution timed out after {:?}",
+            host, timeout
+        ))),
+    }
+}
+
+/// Build a complete wire packet (`[header][MSGPACK\0][msgpack]`) that can be
+/// reused with [`YarClient::call_raw`]. `persistent` sets the keep-alive flag.
+pub fn build_request_packet(
+    method: &str,
+    params: Option<Packager>,
+    persistent: bool,
+) -> YarResult<Vec<u8>> {
+    build_request_packet_with_id(DEFAULT_REQUEST_ID, method, params, persistent)
+}
+
+fn build_request_packet_with_id(
+    request_id: u64,
+    method: &str,
+    params: Option<Packager>,
+    persistent: bool,
+) -> YarResult<Vec<u8>> {
+    let mut request = YarRequest::new(request_id, method);
+    if let Some(p) = params {
+        request.set_parameters(p);
+    }
+
+    let extra_bytes = HEADER_SIZE + PACKAGER_NAME.len();
+    let mut payload = request.pack(extra_bytes)?;
+
+    let body_len = (payload.len() - HEADER_SIZE) as u32;
+    let reserved = if persistent { PROTOCOL_PERSISTENT } else { 0 };
+
+    let mut header = YarHeader::new();
+    header.render(
+        request_id as u32,
+        Some(CLIENT_NAME),
+        None,
+        body_len,
+        reserved,
+    );
+    payload[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+    payload[HEADER_SIZE..HEADER_SIZE + PACKAGER_NAME.len()].copy_from_slice(PACKAGER_NAME);
+
+    Ok(payload)
 }
 
 /// Write all bytes to a stream, handling partial writes and EINTR.
@@ -385,9 +550,13 @@ mod tests {
 
     #[test]
     fn test_client_name() {
-        assert_eq!(CLIENT_NAME, "Yar(Rust)-0.1.0");
+        assert_eq!(
+            CLIENT_NAME,
+            concat!("Yar(Rust)-", env!("CARGO_PKG_VERSION"))
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_client_unix_socket_missing() {
         let result = YarClient::connect("/tmp/nonexistent_yar_test.sock");

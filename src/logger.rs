@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -26,7 +27,7 @@ impl LogLevel {
     /// Return the display string for the log level.
     fn as_str(&self) -> &'static str {
         match self {
-            LogLevel::Ok => "OK",
+            LogLevel::Ok => "OKEY",
             LogLevel::Debug => "DEBUG",
             LogLevel::Notice => "NOTICE",
             LogLevel::Warning => "WARNING",
@@ -39,6 +40,7 @@ impl LogLevel {
 enum LoggerOutput {
     Stderr,
     File(File),
+    #[cfg_attr(not(unix), allow(dead_code))] // pipe targets are Unix-only
     Pipe(std::process::ChildStdin),
 }
 
@@ -82,16 +84,28 @@ impl YarLogger {
         let (output, child) = match path {
             None => (LoggerOutput::Stderr, None),
             Some(p) if p.starts_with('|') => {
-                let cmd = p.trim_start_matches('|').trim();
-                let mut c = Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .stdin(Stdio::piped())
-                    .spawn()?;
-                let stdin = c.stdin.take().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "failed to open pipe stdin")
-                })?;
-                (LoggerOutput::Pipe(stdin), Some(c))
+                #[cfg(unix)]
+                {
+                    let cmd = p.trim_start_matches('|').trim();
+                    let mut c = Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .stdin(Stdio::piped())
+                        .spawn()?;
+                    let stdin = c
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("failed to open pipe stdin"))?;
+                    (LoggerOutput::Pipe(stdin), Some(c))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = p;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "pipe logging is only supported on Unix",
+                    ));
+                }
             }
             Some(p) => {
                 let f = OpenOptions::new().create(true).append(true).open(p)?;
@@ -175,7 +189,7 @@ pub fn init_global(path: Option<&str>, level: LogLevel) -> Result<(), std::io::E
     let logger = YarLogger::init(path, level)?;
     GLOBAL_LOGGER
         .set(logger)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "global logger already set"))
+        .map_err(|_| std::io::Error::other("global logger already set"))
 }
 
 /// Set the hostname on the global logger.
@@ -188,6 +202,19 @@ pub fn set_hostname(hostname: &str) {
 /// Return a reference to the global logger, if initialised.
 pub fn global() -> Option<&'static YarLogger> {
     GLOBAL_LOGGER.get()
+}
+
+/// True when `level` would be emitted by the global logger.
+///
+/// Call this before building a formatted message on a hot path: `format!` at
+/// the call site allocates even when the logger would drop the line.
+pub fn enabled(level: LogLevel) -> bool {
+    match GLOBAL_LOGGER.get() {
+        Some(logger) => {
+            logger.is_enabled() && (level == LogLevel::Ok || level >= logger.min_level())
+        }
+        None => false,
+    }
 }
 
 /// Log a message through the global logger.
@@ -233,7 +260,10 @@ mod tests {
         let mut f = File::open(&path).unwrap();
         f.read_to_string(&mut contents).unwrap();
 
-        assert!(!contents.contains("debug msg"), "debug should be suppressed");
+        assert!(
+            !contents.contains("debug msg"),
+            "debug should be suppressed"
+        );
         assert!(
             !contents.contains("notice msg"),
             "notice should be suppressed"
@@ -341,11 +371,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "yar_logger_test_{}_{}.log",
-            std::process::id(),
-            id
-        ));
+        let path =
+            std::env::temp_dir().join(format!("yar_logger_test_{}_{}.log", std::process::id(), id));
         let _ = std::fs::remove_file(&path);
         File::create(&path)?;
         Ok(TempFile { path })

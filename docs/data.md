@@ -110,14 +110,15 @@ assert_eq!(v1.as_str(), Some("e"));
 
 ### 注意
 
-- `Packager::new()` 建立的是"无类型头"的空包，内容必须是你接下来 push 的第一段完整值；
-  但**读取时 `Unpackager` 只解析从头开始的第一个 msgpack 对象**——
-  如果你 push 了多个"顶层"值，后面的将读不到。请明确 start_array/先写容器头。
+- `Packager::new()` 建立的是"无类型头"的空包，内容必须是你接下来 push 的第一段完整值。
+- `Unpackager` 解析**一个** msgpack 对象；如果后面还有多余字节，会返回
+  `Pack("trailing bytes after msgpack object: N")`，不会静默忽略。
+  因此不要 push 多个"顶层"值，请先写 `start_array`/`start_map` 容器头。
 - 客户端 `call()` 传的每个 `Packager` 都必须包含一个完整 msgpack 值。
 
 ## Unpackager 与 YarData
 
-```rust
+```text
 let data: YarData = Unpackager::new(some_msgpack_bytes)?.into_data();
 
 // 按需读取（Option，类型不匹配为 None）

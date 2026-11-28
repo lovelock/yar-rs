@@ -3,24 +3,8 @@
 //! These tests verify that the Rust protocol implementation produces
 //! wire-compatible bytes with the C yar_protocol implementation.
 
-use yar_rs::*;
 use byteorder::{BigEndian, ByteOrder};
-
-/// Helper: safely read a u32 from a packed YarHeader field.
-macro_rules! packed_u32 {
-    ($h:expr, $field:ident) => {{
-        let h = &$h;
-        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-    }};
-}
-
-/// Helper: safely read a u16 from a packed YarHeader field.
-macro_rules! packed_u16 {
-    ($h:expr, $field:ident) => {{
-        let h = &$h;
-        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(h.$field)) }
-    }};
-}
+use yar_rs::*;
 
 // ---------------------------------------------------------------------------
 // Header size
@@ -68,10 +52,8 @@ fn test_render_produces_c_compatible_bytes() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 64, 0);
 
-    // Read the raw struct bytes (render stores in network byte order)
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    // Serialize to wire bytes (big-endian)
+    let raw = header.to_bytes();
 
     // Bytes 0..4: id = 1 in big-endian
     assert_eq!(BigEndian::read_u32(&raw[0..4]), 1);
@@ -92,11 +74,15 @@ fn test_render_produces_c_compatible_bytes() {
 #[test]
 fn test_render_with_provider_and_token() {
     let mut header = YarHeader::new();
-    header.render(42, Some("my-provider"), Some("my-token"), 1024, PROTOCOL_PERSISTENT);
+    header.render(
+        42,
+        Some("my-provider"),
+        Some("my-token"),
+        1024,
+        PROTOCOL_PERSISTENT,
+    );
 
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
 
     assert_eq!(BigEndian::read_u32(&raw[0..4]), 42);
     assert_eq!(BigEndian::read_u32(&raw[6..10]), PROTOCOL_MAGIC);
@@ -117,16 +103,35 @@ fn test_render_with_provider_and_token() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_provider_token_truncated_at_16_bytes() {
-    // C render() only copies 16 bytes of provider/token despite the 32-byte fields
+fn test_provider_token_keep_31_bytes() {
+    // C uses strncpy(..., sizeof(field)) and forces byte 31 to NUL, so up to
+    // 31 bytes of provider/token survive.
     let long_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // 36 bytes
     let mut header = YarHeader::new();
     header.render(1, Some(long_str), Some(long_str), 0, 0);
 
-    assert_eq!(&header.provider[..16], b"ABCDEFGHIJKLMNOP");
-    assert_eq!(&header.provider[16..32], &[0u8; 16]);
-    assert_eq!(&header.token[..16], b"ABCDEFGHIJKLMNOP");
-    assert_eq!(&header.token[16..32], &[0u8; 16]);
+    assert_eq!(&header.provider[..31], &long_str.as_bytes()[..31]);
+    assert_eq!(header.provider[31], 0);
+    assert_eq!(&header.token[..31], &long_str.as_bytes()[..31]);
+    assert_eq!(header.token[31], 0);
+}
+
+#[test]
+fn render_then_to_bytes_is_wire_compatible() {
+    let mut header = YarHeader::new();
+    header.render(0x12345678, Some("provider"), Some("token"), 100, 7);
+
+    let bytes = header.to_bytes();
+    assert_eq!(BigEndian::read_u32(&bytes[0..4]), 0x12345678);
+    assert_eq!(BigEndian::read_u32(&bytes[6..10]), PROTOCOL_MAGIC);
+    assert_eq!(BigEndian::read_u32(&bytes[10..14]), 7);
+    assert_eq!(BigEndian::read_u32(&bytes[78..82]), 100);
+
+    let parsed = YarHeader::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.id, 0x12345678);
+    assert_eq!(parsed.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(parsed.body_len, 100);
+    assert_eq!(parsed.reserved, 7);
 }
 
 #[test]
@@ -146,20 +151,20 @@ fn test_from_bytes_parses_c_wire_format() {
     // Construct bytes exactly as C would lay them out on the wire
     let mut buf = vec![0u8; HEADER_SIZE];
 
-    BigEndian::write_u32(&mut buf[0..4], 42);           // id
-    BigEndian::write_u16(&mut buf[4..6], 2);            // version
+    BigEndian::write_u32(&mut buf[0..4], 42); // id
+    BigEndian::write_u16(&mut buf[4..6], 2); // version
     BigEndian::write_u32(&mut buf[6..10], PROTOCOL_MAGIC); // magic
     BigEndian::write_u32(&mut buf[10..14], PROTOCOL_PERSISTENT); // reserved
-    buf[14..19].copy_from_slice(b"hello");               // provider
-    buf[46..51].copy_from_slice(b"world");               // token
-    BigEndian::write_u32(&mut buf[78..82], 512);         // body_len
+    buf[14..19].copy_from_slice(b"hello"); // provider
+    buf[46..51].copy_from_slice(b"world"); // token
+    BigEndian::write_u32(&mut buf[78..82], 512); // body_len
 
     let header = YarHeader::from_bytes(&buf).unwrap();
-    assert_eq!(packed_u32!(header, id), 42);
-    assert_eq!(packed_u16!(header, version), 2);
-    assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(header, reserved), PROTOCOL_PERSISTENT);
-    assert_eq!(packed_u32!(header, body_len), 512);
+    assert_eq!(header.id, 42);
+    assert_eq!(header.version, 2);
+    assert_eq!(header.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(header.reserved, PROTOCOL_PERSISTENT);
+    assert_eq!(header.body_len, 512);
     assert_eq!(&header.provider[..5], b"hello");
     assert_eq!(&header.token[..5], b"world");
 }
@@ -187,18 +192,18 @@ fn test_to_bytes_from_bytes_roundtrip() {
     header.version = 3;
     header.render(42, Some("provider1"), Some("token1"), 1024, 0xFF);
 
-    // Convert to host byte order first (render puts in network order)
+    // render() stores host-order fields; parse() just validates.
     header.parse().unwrap();
 
     let bytes = header.to_bytes();
     assert_eq!(bytes.len(), HEADER_SIZE);
 
     let parsed = YarHeader::from_bytes(&bytes).unwrap();
-    assert_eq!(packed_u32!(parsed, id), 42);
-    assert_eq!(packed_u16!(parsed, version), 3);
-    assert_eq!(packed_u32!(parsed, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(parsed, body_len), 1024);
-    assert_eq!(packed_u32!(parsed, reserved), 0xFF);
+    assert_eq!(parsed.id, 42);
+    assert_eq!(parsed.version, 3);
+    assert_eq!(parsed.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(parsed.body_len, 1024);
+    assert_eq!(parsed.reserved, 0xFF);
     assert_eq!(&parsed.provider[..9], b"provider1");
     assert_eq!(&parsed.token[..6], b"token1");
 }
@@ -216,11 +221,11 @@ fn test_render_parse_roundtrip() {
     let mut parsed = header;
     assert!(parsed.parse().is_ok());
 
-    assert_eq!(packed_u32!(parsed, id), 99);
-    assert_eq!(packed_u16!(parsed, version), 1);
-    assert_eq!(packed_u32!(parsed, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(parsed, body_len), 256);
-    assert_eq!(packed_u32!(parsed, reserved), 7);
+    assert_eq!(parsed.id, 99);
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(parsed.body_len, 256);
+    assert_eq!(parsed.reserved, 7);
     assert_eq!(&parsed.provider[..13], b"test-provider");
     assert_eq!(&parsed.token[..10], b"test-token");
 }
@@ -234,8 +239,8 @@ fn test_parse_validates_magic() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 0, 0);
     assert!(header.parse().is_ok());
-    assert_eq!(packed_u32!(header, id), 1);
-    assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
+    assert_eq!(header.id, 1);
+    assert_eq!(header.magic_num, PROTOCOL_MAGIC);
 }
 
 #[test]
@@ -254,9 +259,7 @@ fn test_persistent_flag_in_reserved() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 0, PROTOCOL_PERSISTENT);
 
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
     assert_eq!(BigEndian::read_u32(&raw[10..14]), PROTOCOL_PERSISTENT);
 }
 
@@ -265,9 +268,7 @@ fn test_ping_flag_in_reserved() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 0, PROTOCOL_PING);
 
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
     assert_eq!(BigEndian::read_u32(&raw[10..14]), PROTOCOL_PING);
 }
 
@@ -276,9 +277,7 @@ fn test_list_flag_in_reserved() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 0, PROTOCOL_LIST);
 
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
     assert_eq!(BigEndian::read_u32(&raw[10..14]), PROTOCOL_LIST);
 }
 
@@ -288,14 +287,12 @@ fn test_combined_flags_in_reserved() {
     let mut header = YarHeader::new();
     header.render(1, None, None, 0, flags);
 
-    let raw: [u8; HEADER_SIZE] = unsafe {
-        std::ptr::read_unaligned(&header as *const YarHeader as *const [u8; HEADER_SIZE])
-    };
+    let raw = header.to_bytes();
     assert_eq!(BigEndian::read_u32(&raw[10..14]), flags);
 
     // Parse and verify flags survive roundtrip
     let parsed = YarHeader::from_bytes(&raw).unwrap();
-    assert_eq!(packed_u32!(parsed, reserved), flags);
+    assert_eq!(parsed.reserved, flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,21 +303,21 @@ fn test_combined_flags_in_reserved() {
 fn test_wire_byte_layout_matches_c() {
     // Build a complete wire-format header as C would produce it
     let mut wire = vec![0u8; HEADER_SIZE];
-    BigEndian::write_u32(&mut wire[0..4], 0x12345678);  // id
-    BigEndian::write_u16(&mut wire[4..6], 0x0001);      // version
+    BigEndian::write_u32(&mut wire[0..4], 0x12345678); // id
+    BigEndian::write_u16(&mut wire[4..6], 0x0001); // version
     BigEndian::write_u32(&mut wire[6..10], PROTOCOL_MAGIC); // magic
     BigEndian::write_u32(&mut wire[10..14], 0x00000003); // reserved (PERSISTENT|PING)
-    // provider at 14..46: "test\0..." (only first 4 bytes non-zero)
+                                                         // provider at 14..46: "test\0..." (only first 4 bytes non-zero)
     wire[14..18].copy_from_slice(b"test");
     // token at 46..78: all zeros
     BigEndian::write_u32(&mut wire[78..82], 0x00000100); // body_len = 256
 
     let header = YarHeader::from_bytes(&wire).unwrap();
-    assert_eq!(packed_u32!(header, id), 0x12345678);
-    assert_eq!(packed_u16!(header, version), 1);
-    assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(header, reserved), 3);
-    assert_eq!(packed_u32!(header, body_len), 256);
+    assert_eq!(header.id, 0x12345678);
+    assert_eq!(header.version, 1);
+    assert_eq!(header.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(header.reserved, 3);
+    assert_eq!(header.body_len, 256);
     assert_eq!(&header.provider[..4], b"test");
 
     // to_bytes should reproduce the exact same wire format
@@ -345,7 +342,7 @@ fn test_packager_name_constant() {
 
 #[test]
 fn test_version_constant() {
-    assert_eq!(yar_rs::VERSION, "0.1.0");
+    assert_eq!(yar_rs::VERSION, env!("CARGO_PKG_VERSION"));
 }
 
 // ---------------------------------------------------------------------------
@@ -355,10 +352,10 @@ fn test_version_constant() {
 #[test]
 fn test_default_header_has_magic() {
     let header = YarHeader::new();
-    assert_eq!(packed_u32!(header, magic_num), PROTOCOL_MAGIC);
-    assert_eq!(packed_u32!(header, id), 0);
-    assert_eq!(packed_u32!(header, body_len), 0);
-    assert_eq!(packed_u32!(header, reserved), 0);
+    assert_eq!(header.magic_num, PROTOCOL_MAGIC);
+    assert_eq!(header.id, 0);
+    assert_eq!(header.body_len, 0);
+    assert_eq!(header.reserved, 0);
     assert_eq!(header.provider, [0u8; 32]);
     assert_eq!(header.token, [0u8; 32]);
 }
