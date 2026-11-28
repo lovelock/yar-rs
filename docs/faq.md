@@ -1,117 +1,113 @@
-# FAQ 与迁移指南
+# FAQ
 
-## 从 C 版 yar 迁移：API 对照表
+[Back to the guide index](README.md)
 
-| C API | yar-rs 对应 |
-|---|---|
-| `yar_server_init("127.0.0.1:8888")` | `YarServer::new("127.0.0.1:8888")` |
-| `yar_server_register_handler(handlers[])` | `server.register_handler("name", 闭包).await`（同步闭包 `Fn(&YarRequest) -> YarResponse`） |
-| `yar_server_run()` | `server.run().await` |
-| `yar_server_set_opt(YAR_READ_TIMEOUT, &t)` | `server.set_read_timeout(Duration)` |
-| `YAR_LOG_FILE` | `server.set_log_file(path)` |
-| `YAR_LOG_LEVEL` | `server.set_log_level(LogLevel)` |
-| 每请求 OKEY 访问日志 | 默认开启；`server.set_access_log(false)` 关闭 |
-| `YAR_MAX_CHILDREN` (pre-fork worker) | `server.set_max_inflight(n)`（同时服务的连接数；不是进程数） |
-| `YAR_PPID/CHILD_INIT` hooks | 暂未实现（Rust 版无 pre-fork） |
-| `YAR_PID_FILE` | `server.set_pid_file(path)`（启动时写入当前 PID） |
-| `yar_client_init("tcp://host:port")` | `YarClient::connect("host:port")` 或 `"tcp://host:port"` |
-| `client->call(client, method, n, args)` | `client.call(method, Vec<Packager>)`；热路径可用 `build_request_packet` + `call_raw` |
-| `yar_client_set_opt(YAR_TIMEOUT, &t)` | `client.set_timeout(Duration)` |
-| `YAR_PERSISTENT_LINK` | `client.set_persistent(bool)` |
-| `yar_client_destroy(client)` | `client.close()`（消费型） |
-| `yar_pack_start_map(n)/start_array(n)` | `Packager::start_map(n) / start_array(n)` |
-| `yar_pack_push_*` | `pk.push_bool / push_long / push_ulong / push_double / push_string / push_array / push_map / push_null / push_data / push_packager` |
-| `yar_pack_to_string(pk, &payload)` | `pk.into_bytes()` / `pk.as_bytes()` |
-| `yar_unpack_data_*`, `yar_unpack_iterator_*` | `YarData.as_*()` / `YarData.iter()`（详见[数据模型](data.md)） |
-| `yar_request_pack/unpack/set_parameters` | `YarRequest::pack/unpack/set_parameters` |
-| `yar_response_set_error/set_retval/get_status` | `YarResponse::set_error / set_retval / get_status` |
+## What is the relationship to the original Yar project?
 
-## 常见问题
+`yar-rs` implements the Yar RPC protocol in Rust. It is an independent
+project, not a fork of the C code or its documentation. The C implementation
+([laruence/yar-c](https://github.com/laruence/yar-c)) and the PHP extension
+([laruence/yar](https://github.com/laruence/yar)) remain the reference for
+the wire format and for existing deployments. Because the frame and
+envelopes match, a `yar-rs` server and a C/PHP/Java client (or the reverse)
+can talk to each other.
 
-### Q1：`call` 报 `Connection("connection closed: expected 82 bytes, got 0")`
+## Why does the server not look like the C server?
 
-非持久模式下服务端响应一次后就关闭连接（与 C 服务端行为一致），第二次 `call`
-复用了已关闭的连接。解决：`client.set_persistent(true)`，或每次调用新建 client。
+The C server uses pre-forked event-loop workers. `yar-rs` uses one process
+with a Tokio listener and one task per connection. That gives the same
+external behavior (concurrent persistent connections, sequential requests
+per connection) with a Rust-native concurrency model. There is no worker
+count to tune; Tokio's worker threads follow the process's CPU availability.
 
-### Q2：`connect("localhost")` 失败：must include port
+## Can I run it as a daemon or pre-fork it?
 
-TCP 地址必须写成 `host:port`。
+No. Daemonization, pre-fork workers, worker restart and uid/gid drop are not
+implemented. Run it under your process supervisor or service manager. The
+PID file option writes the current PID for tooling that expects one.
 
-### Q3：`connect("http://...")` 失败：HTTP/HTTPS not supported
+## How do I stop the server gracefully?
 
-Yar 是原始 TCP 协议。Unix socket 可用 `/path/to.sock`（客户端与服务端均支持，仅 Unix 平台）。
-`tcp://host:port` 前缀在客户端和服务端都会被接受（与 C 一致）。
+`YarServer::run()` serves until the process exits. There is no drain API:
+stopping the process closes the listener and drops the connection tasks.
+Use the supervisor's stop signal and let the process exit.
 
-### Q4：handler 里读到的整数跟推送的类型不一致
+## How many connections can it serve?
 
-msgpack 紧凑编码导致"小正数解包为 Ulong"——
-用 `as_integer()` 统一读取（详见[数据模型](data.md)的"整数解码陷阱"一节）。
+The default `max_inflight` is 1024 connections. A permit is held for the
+whole connection, so persistent connections count until they close. Set
+`set_max_inflight(0)` to disable the gate. Memory and file descriptors are
+the real limits; each connection buffers at most one request body.
 
-### Q5：如何在 `#[tokio::main]` 里发起调用
+## Handlers are synchronous. Where do I put slow work?
 
-`call()` 是阻塞的，放进 `tokio::task::spawn_blocking`（见[客户端指南](client.md#在-async-代码中使用)）。
+A handler runs on the connection task's worker thread. Move blocking or
+CPU-heavy work off it with `tokio::task::block_in_place` on a multi-thread
+runtime, or with your own thread pool. Handlers cannot `await`; this keeps
+the API close to the C callback model.
 
-### Q6：handler 能不能是 async fn
+## Why is the client blocking?
 
-不能。当前 handler 是同步闭包；耗时 CPU/IO 工作请用 `spawn_blocking` 或
-线程池处理后返回结果。
+It matches the C client and is simple to embed in synchronous programs.
+From async code, use `tokio::task::spawn_blocking`. There is one in-flight
+call per connection and no request-id multiplexing; use one client per task
+for concurrency.
 
-### Q7：服务端能同时服务多少连接
+## Why do I get a "poisoned" error after a timeout?
 
-每连接一个 Tokio task；默认 `set_max_inflight(1024)`，可设为 `0` 关闭限制。
-同时受内存/文件句柄限制。
+A timeout or transport error can leave a late response in the socket.
+Reusing the connection could return that stale response for the next call,
+so the client refuses further calls until you reconnect.
 
-### Q8：多请求并发/请求 ID
+## Why does a call return `Ok` with a non-zero status?
 
-Rust 客户端沿用了 C 客户端的实现，请求 id 固定为 `1000`，同一连接同一时刻
-只有一次在途调用；id 匹配、多路复用是不支持的。
+Business failures are responses, not transport errors: check
+`YarResponse::get_status()`. Server-generated errors use status 8. Transport
+and decode failures are `Err`.
 
-### Q9：服务端收到了什么请求会断开连接
+## Where do the error status and truncation numbers come from?
 
-- 读取头部/体失败（对端断开、超时）；
-- 请求头魔数不合法；
-- body 长度小于 8 字节无法容纳 packager 名；
-- packager 名不是 `b"MSGPACK\0"`：**先回 status 8 的错误响应**，非持久连接随后断开；
-- 请求体解码失败（此时先回错误响应再断开）；
-- 声明 body 超过 `max_request_size`（默认 10 MiB）：不读 body，先回错误响应；
-- 非持久请求完成响应后（正常路径）。
+They match the C server: server-generated status 8 (`YAR_ERROR`) and error
+text truncated to 1023 bytes (1020 + `...`) so the frame fits the C
+server's 1024-byte error buffer.
 
-### Q10：header 字段怎么读
+## Is `tcp://` supported? Unix sockets? Windows?
 
-`YarHeader` 中的数值字段是**主机字节序**，可以直接读 `header.id` 等字段；
-线上格式用 `to_bytes()` 生成、`from_bytes()` 解析（内部做大小端转换）。
-说明见[协议页](protocol.md)。
+`tcp://host:port` is accepted by the client and server. Unix domain sockets
+are supported on Unix for both sides; on other platforms they return an
+unsupported error. TCP works on Windows and macOS; the test suite runs on
+all three.
 
-## 已知限制（如实列出）
+## What are the size limits?
 
-1. Windows 上不支持 Unix domain socket（TCP 可用）；
-2. 服务端没有 graceful shutdown API、没有 pre-fork/daemon 模式；
-3. `PROTOCOL_PING` / `PROTOCOL_LIST` 仅保留常量，未实现；
-4. 服务端仍会把请求体完整缓冲后解析；默认 10 MiB 上限 + msgpack 深度/长度/节点限制，
-   但高并发大包仍会占用相应内存，建议配合 `set_max_inflight` 或前置限流；
-5. 错误信息按 C 的 1024 字节缓冲区截断为 **1023 字节**（1020 + `"..."`）；provider/token 最多 31 字节（与 C 一致）；
-6. 客户端为同步阻塞 API，async 环境需转发到阻塞线程；
-7. 未实现上游的可选 JSON packager；收到 `JSON` tag 时回与 C 未编译 cJSON 时相同的错误响应。
+10 MiB request body (server) and response body (client), checked before
+allocation. The msgpack parser also limits nesting to 128 and the number of
+nodes to 262,144, rejects declared lengths larger than the remaining input,
+and rejects trailing bytes.
 
-## 与 C 版的可观察差异
+## Are the C and Rust values byte-identical?
 
-| 项目 | C (`../yar-c`) | yar-rs |
-|---|---|---|
-| 服务端生成的错误 status | **8**（`YAR_ERROR`） | **8**（`SERVER_ERROR_STATUS`） |
-| 请求体上限 | 10 MiB | 10 MiB |
-| 服务端默认读超时 | 3 秒 | 3 秒（库和二进制） |
-| 客户端默认超时 | 1 秒 | 1 秒 |
-| 响应体上限（客户端） | 10 MiB | 10 MiB |
-| 错误信息截断 | 1023 字节 | 1023 字节 |
-| 未知 packager | 回错误响应 | 回错误响应 |
-| Unix socket 服务端 | 支持 | 支持（仅 Unix 平台） |
-| `tcp://` 前缀 | 支持 | 支持 |
-| 每请求访问日志 | OKEY/ERROR + `fflush` | OKEY/ERROR（默认开启，可关闭） |
-| JSON packager | 可选（cJSON） | 未实现 |
-| daemon/pre-fork/uid/gid | 支持 | 未实现（设计选择） |
+For the supported types, yes: same msgpack compact integer encoding, same
+envelopes, same header layout. See [Protocol](protocol.md). The provider
+name and the client implementation name differ; neither affects routing.
 
-## 文档示例的正确性保障
+## Why is `4 MiB × 640 VUs` missing from the benchmark?
 
-[tests/doc_examples.rs](../tests/doc_examples.rs) 覆盖本目录中的主要可运行示例，
-`cargo test` 会编译检查 API 签名，并对关键行为做断言。纯说明性片段用 `text`
-标记。贡献者修改 API 或文档时应同步更新测试，避免文档漂移。
+That cell needs more than 4 GiB of server-side body buffers (640 × 4 MiB)
+before any copies, so the 2 GiB server is OOM-killed. The benchmark
+documents this and uses `--sizes`/`--vus` for feasible subsets. See
+[the benchmark guide](https://github.com/lovelock/yar-rs/blob/master/profile/README.md).
+
+## What is not implemented?
+
+- The optional JSON packager (a JSON-tagged request gets the same error the
+  C build without cJSON returns).
+- `PROTOCOL_PING` / `PROTOCOL_LIST` (constants only, as in the C server).
+- Request-id multiplexing, daemon/pre-fork, graceful drain.
+
+## I am coming from the C API. Where do I start?
+
+Read [Getting started](getting-started.md) and [Client](client.md), then the
+small mapping table in the [README](../README.md) for the Rust names of the
+C concepts. For the protocol itself, the C project's README is the
+authority.
