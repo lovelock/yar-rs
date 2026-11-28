@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the tag matches the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "Cargo.toml version $version does not match tag $tag" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Publish to crates.io (unless the version already exists)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          status=$(curl -sS -A "yar-rs-release-workflow" -o /dev/null -w "%{http_code}" \
+            "https://crates.io/api/v1/crates/yar-rs/$version")
+          if [ "$status" = "200" ]; then
+            echo "yar-rs $version is already on crates.io; skipping publish"
+          else
+            cargo publish --registry crates-io
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
