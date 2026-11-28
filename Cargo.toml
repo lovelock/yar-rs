@@ -56,3 +56,7 @@ thiserror = "2"
 name = "profiler"
 path = "src/bin/profiler.rs"
 required-features = ["profiler"]
+
+# docs.rs builds the full API, including the feature-gated profiler module.
+[package.metadata.docs.rs]
+all-features = true
